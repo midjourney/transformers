@@ -24,6 +24,7 @@ from transformers.testing_utils import require_torch, require_vision, slow, torc
 
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import ModelTesterMixin, floats_tensor, ids_tensor
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
@@ -37,7 +38,7 @@ if is_torch_available():
 if is_vision_available():
     from PIL import Image
 
-    from transformers import AutoFeatureExtractor
+    from transformers import AutoImageProcessor
 
 
 class RegNetModelTester:
@@ -118,13 +119,18 @@ class RegNetModelTester:
 
 
 @require_torch
-class RegNetModelTest(ModelTesterMixin, unittest.TestCase):
+class RegNetModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     """
     Here we also overwrite some of the tests of test_modeling_common.py, as RegNet does not use input_ids, inputs_embeds,
     attention_mask and seq_length.
     """
 
     all_model_classes = (RegNetModel, RegNetForImageClassification) if is_torch_available() else ()
+    pipeline_model_mapping = (
+        {"feature-extraction": RegNetModel, "image-classification": RegNetForImageClassification}
+        if is_torch_available()
+        else {}
+    )
 
     test_pruning = False
     test_resize_embeddings = False
@@ -146,10 +152,6 @@ class RegNetModelTest(ModelTesterMixin, unittest.TestCase):
 
     def create_and_test_config_common_properties(self):
         return
-
-    @unittest.skip(reason="RegNet does not output attentions")
-    def test_attention_outputs(self):
-        pass
 
     @unittest.skip(reason="RegNet does not use inputs_embeds")
     def test_inputs_embeds(self):
@@ -246,9 +248,9 @@ def prepare_img():
 @require_vision
 class RegNetModelIntegrationTest(unittest.TestCase):
     @cached_property
-    def default_feature_extractor(self):
+    def default_image_processor(self):
         return (
-            AutoFeatureExtractor.from_pretrained(REGNET_PRETRAINED_MODEL_ARCHIVE_LIST[0])
+            AutoImageProcessor.from_pretrained(REGNET_PRETRAINED_MODEL_ARCHIVE_LIST[0])
             if is_vision_available()
             else None
         )
@@ -257,9 +259,9 @@ class RegNetModelIntegrationTest(unittest.TestCase):
     def test_inference_image_classification_head(self):
         model = RegNetForImageClassification.from_pretrained(REGNET_PRETRAINED_MODEL_ARCHIVE_LIST[0]).to(torch_device)
 
-        feature_extractor = self.default_feature_extractor
+        image_processor = self.default_image_processor
         image = prepare_img()
-        inputs = feature_extractor(images=image, return_tensors="pt").to(torch_device)
+        inputs = image_processor(images=image, return_tensors="pt").to(torch_device)
 
         # forward pass
         with torch.no_grad():

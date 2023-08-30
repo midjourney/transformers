@@ -65,6 +65,9 @@ class UniSpeechConfig(PretrainedConfig):
             The dropout ratio for the attention probabilities.
         final_dropout (`float`, *optional*, defaults to 0.1):
             The dropout probability for the final projection layer of [`UniSpeechForCTC`].
+        layerdrop (`float`, *optional*, defaults to 0.1):
+            The LayerDrop probability. See the [LayerDrop paper](see https://arxiv.org/abs/1909.11556) for more
+            details.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         layer_norm_eps (`float`, *optional*, defaults to 1e-12):
@@ -164,12 +167,12 @@ class UniSpeechConfig(PretrainedConfig):
     Example:
 
     ```python
-    >>> from transformers import UniSpeechModel, UniSpeechConfig
+    >>> from transformers import UniSpeechConfig, UniSpeechModel
 
     >>> # Initializing a UniSpeech facebook/unispeech-base-960h style configuration
     >>> configuration = UniSpeechConfig()
 
-    >>> # Initializing a model from the facebook/unispeech-base-960h style configuration
+    >>> # Initializing a model (with random weights) from the facebook/unispeech-base-960h style configuration
     >>> model = UniSpeechModel(configuration)
 
     >>> # Accessing the model configuration
@@ -226,7 +229,7 @@ class UniSpeechConfig(PretrainedConfig):
         bos_token_id=1,
         eos_token_id=2,
         replace_prob=0.5,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs, pad_token_id=pad_token_id, bos_token_id=bos_token_id, eos_token_id=eos_token_id)
         self.hidden_size = hidden_size

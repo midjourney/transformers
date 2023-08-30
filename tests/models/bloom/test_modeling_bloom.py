@@ -20,9 +20,10 @@ import unittest
 from transformers import BloomConfig, is_torch_available
 from transformers.testing_utils import require_torch, require_torch_gpu, slow, torch_device
 
-from ...generation.test_generation_utils import GenerationTesterMixin
+from ...generation.test_utils import GenerationTesterMixin
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import ModelTesterMixin, ids_tensor, random_attention_mask
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
@@ -53,7 +54,7 @@ class BloomModelTester:
         use_mc_token_ids=True,
         vocab_size=99,
         hidden_size=32,
-        num_hidden_layers=5,
+        num_hidden_layers=2,
         num_attention_heads=4,
         intermediate_size=37,
         hidden_act="gelu",
@@ -315,8 +316,7 @@ class BloomModelTester:
 
 
 @require_torch
-class BloomModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
-
+class BloomModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (
         (
             BloomModel,
@@ -330,6 +330,18 @@ class BloomModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase)
     )
 
     all_generative_model_classes = (BloomForCausalLM,) if is_torch_available() else ()
+    pipeline_model_mapping = (
+        {
+            "feature-extraction": BloomModel,
+            "question-answering": BloomForQuestionAnswering,
+            "text-classification": BloomForSequenceClassification,
+            "text-generation": BloomForCausalLM,
+            "token-classification": BloomForTokenClassification,
+            "zero-shot": BloomForSequenceClassification,
+        }
+        if is_torch_available()
+        else {}
+    )
     fx_compatible = True
     test_missing_keys = False
     test_pruning = False
@@ -378,6 +390,10 @@ class BloomModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase)
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_bloom_weight_initialization(*config_and_inputs)
 
+    @unittest.skip("Bloom has a non-standard KV cache format.")
+    def test_past_key_values_format(self):
+        pass
+
     @slow
     def test_model_from_pretrained(self):
         for model_name in BLOOM_PRETRAINED_MODEL_ARCHIVE_LIST[:1]:
@@ -407,7 +423,7 @@ class BloomModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase)
         # >=1b1 + allow_fp16_reduced_precision_reduction = False  + torch.bmm  ==> PASS
 
         path_560m = "bigscience/bloom-560m"
-        model = BloomForCausalLM.from_pretrained(path_560m, use_cache=True, revision="gs555750").cuda()
+        model = BloomForCausalLM.from_pretrained(path_560m, use_cache=True, revision="gs555750").to(torch_device)
         model = model.eval()
         tokenizer = BloomTokenizerFast.from_pretrained(path_560m)
 
@@ -419,7 +435,7 @@ class BloomModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase)
         )
 
         input_ids = tokenizer.encode(input_sentence, return_tensors="pt")
-        greedy_output = model.generate(input_ids.cuda(), max_length=50)
+        greedy_output = model.generate(input_ids.to(torch_device), max_length=50)
 
         self.assertEqual(tokenizer.decode(greedy_output[0], skip_special_tokens=True), EXPECTED_OUTPUT)
 
@@ -427,16 +443,16 @@ class BloomModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase)
     @require_torch_gpu
     def test_batch_generation(self):
         path_560m = "bigscience/bloom-560m"
-        model = BloomForCausalLM.from_pretrained(path_560m, use_cache=True, revision="gs555750").cuda()
+        model = BloomForCausalLM.from_pretrained(path_560m, use_cache=True, revision="gs555750").to(torch_device)
         model = model.eval()
         tokenizer = BloomTokenizerFast.from_pretrained(path_560m, padding_side="left")
 
         input_sentence = ["I enjoy walking with my cute dog", "I enjoy walking with my cute dog"]
 
-        input_ids = tokenizer.batch_encode_plus(input_sentence, return_tensors="pt", padding=True)
-        greedy_output = model.generate(
-            input_ids["input_ids"].cuda(), attention_mask=input_ids["attention_mask"], max_length=50, do_sample=False
-        )
+        inputs = tokenizer.batch_encode_plus(input_sentence, return_tensors="pt", padding=True)
+        input_ids = inputs["input_ids"].to(torch_device)
+        attention_mask = inputs["attention_mask"]
+        greedy_output = model.generate(input_ids, attention_mask=attention_mask, max_length=50, do_sample=False)
 
         self.assertEqual(
             tokenizer.decode(greedy_output[0], skip_special_tokens=True),
@@ -446,9 +462,8 @@ class BloomModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase)
     @slow
     @require_torch_gpu
     def test_batch_generation_padd(self):
-
         path_560m = "bigscience/bloom-560m"
-        model = BloomForCausalLM.from_pretrained(path_560m, use_cache=True, revision="gs555750").cuda()
+        model = BloomForCausalLM.from_pretrained(path_560m, use_cache=True, revision="gs555750").to(torch_device)
         model = model.eval()
         tokenizer = BloomTokenizerFast.from_pretrained(path_560m, padding_side="left")
 
@@ -458,10 +473,11 @@ class BloomModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase)
         input_ids = tokenizer.batch_encode_plus(input_sentence, return_tensors="pt", padding=True)
         input_ids_without_pad = tokenizer.encode(input_sentence_without_pad, return_tensors="pt")
 
-        greedy_output = model.generate(
-            input_ids["input_ids"].cuda(), attention_mask=input_ids["attention_mask"], max_length=50, do_sample=False
+        input_ids, attention_mask = input_ids["input_ids"].to(torch_device), input_ids["attention_mask"]
+        greedy_output = model.generate(input_ids, attention_mask=attention_mask, max_length=50, do_sample=False)
+        greedy_output_without_pad = model.generate(
+            input_ids_without_pad.to(torch_device), max_length=50, do_sample=False
         )
-        greedy_output_without_pad = model.generate(input_ids_without_pad.cuda(), max_length=50, do_sample=False)
 
         # test token values
         self.assertEqual(greedy_output[-1, 3:].tolist(), greedy_output_without_pad[0, :-3].tolist())
@@ -471,6 +487,33 @@ class BloomModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase)
             tokenizer.decode(greedy_output[-1, 3:], skip_special_tokens=True),
             tokenizer.decode(greedy_output_without_pad[0, :-3], skip_special_tokens=True),
         )
+
+    @slow
+    @require_torch_gpu
+    def test_batch_generated_text(self):
+        path_560m = "bigscience/bloom-560m"
+
+        model = BloomForCausalLM.from_pretrained(path_560m, use_cache=True, revision="gs555750").to(torch_device)
+        model = model.eval()
+        tokenizer = BloomTokenizerFast.from_pretrained(path_560m, padding_side="left")
+
+        input_sentences = [
+            "Hello what is",
+            "Running a quick test with the",
+        ]
+        inputs = tokenizer(input_sentences, return_tensors="pt", padding=True, truncation=True)
+        generated_ids = model.generate(
+            inputs["input_ids"].to(torch_device), attention_mask=inputs["attention_mask"], max_length=20
+        )
+        generated_text = tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+
+        # these generations match those of the PyTorch model
+        EXPECTED_GENERATIONS = [
+            "Hello what is the best way to get the data from the server? I have tried",
+            "Running a quick test with the following command:\nsudo apt-get install python3\nsudo apt-get install python2",
+        ]
+
+        self.assertListEqual(generated_text, EXPECTED_GENERATIONS)
 
 
 @require_torch
@@ -502,7 +545,8 @@ class BloomEmbeddingTest(unittest.TestCase):
 
     @require_torch
     def test_embeddings(self):
-        model = BloomForCausalLM.from_pretrained(self.path_bigscience_model, torch_dtype="auto")  # load in fp32
+        # The config in this checkpoint has `bfloat16` as `torch_dtype` -> model in `bfloat16`
+        model = BloomForCausalLM.from_pretrained(self.path_bigscience_model, torch_dtype="auto")
         model.eval()
 
         EMBEDDINGS_DS_BEFORE_LN_BF_16_MEAN = {

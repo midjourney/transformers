@@ -72,7 +72,7 @@ class EncoderDecoderMixin:
         decoder_config,
         decoder_input_ids,
         decoder_attention_mask,
-        **kwargs
+        **kwargs,
     ):
         encoder_decoder_config = EncoderDecoderConfig.from_encoder_decoder_configs(config, decoder_config)
         self.assertTrue(encoder_decoder_config.decoder.is_decoder)
@@ -106,7 +106,7 @@ class EncoderDecoderMixin:
         decoder_config,
         decoder_input_ids,
         decoder_attention_mask,
-        **kwargs
+        **kwargs,
     ):
         encoder_model, decoder_model = self.get_encoder_decoder_model(config, decoder_config)
         enc_dec_model = EncoderDecoderModel(encoder=encoder_model, decoder=decoder_model)
@@ -167,7 +167,7 @@ class EncoderDecoderMixin:
         decoder_config,
         decoder_input_ids,
         decoder_attention_mask,
-        **kwargs
+        **kwargs,
     ):
         encoder_model, decoder_model = self.get_encoder_decoder_model(config, decoder_config)
         with tempfile.TemporaryDirectory() as encoder_tmp_dirname, tempfile.TemporaryDirectory() as decoder_tmp_dirname:
@@ -210,7 +210,7 @@ class EncoderDecoderMixin:
         decoder_input_ids,
         decoder_attention_mask,
         return_dict,
-        **kwargs
+        **kwargs,
     ):
         encoder_model, decoder_model = self.get_encoder_decoder_model(config, decoder_config)
         kwargs = {"encoder_model": encoder_model, "decoder_model": decoder_model, "return_dict": return_dict}
@@ -240,7 +240,7 @@ class EncoderDecoderMixin:
         decoder_config,
         decoder_input_ids,
         decoder_attention_mask,
-        **kwargs
+        **kwargs,
     ):
         encoder_model, decoder_model = self.get_encoder_decoder_model(config, decoder_config)
         enc_dec_model = EncoderDecoderModel(encoder=encoder_model, decoder=decoder_model)
@@ -281,7 +281,7 @@ class EncoderDecoderMixin:
         decoder_config,
         decoder_input_ids,
         decoder_attention_mask,
-        **kwargs
+        **kwargs,
     ):
         encoder_model, decoder_model = self.get_encoder_decoder_model(config, decoder_config)
         enc_dec_model = EncoderDecoderModel(encoder=encoder_model, decoder=decoder_model)
@@ -327,7 +327,7 @@ class EncoderDecoderMixin:
         decoder_input_ids,
         decoder_attention_mask,
         labels,
-        **kwargs
+        **kwargs,
     ):
         encoder_model, decoder_model = self.get_encoder_decoder_model(config, decoder_config)
         enc_dec_model = EncoderDecoderModel(encoder=encoder_model, decoder=decoder_model)
@@ -395,7 +395,7 @@ class EncoderDecoderMixin:
         decoder_input_ids,
         decoder_attention_mask,
         labels,
-        **kwargs
+        **kwargs,
     ):
         # make the decoder inputs a different shape from the encoder inputs to harden the test
         decoder_input_ids = decoder_input_ids[:, :-1]
@@ -424,7 +424,7 @@ class EncoderDecoderMixin:
         decoder_input_ids,
         decoder_attention_mask,
         labels,
-        **kwargs
+        **kwargs,
     ):
         # Similar to `check_encoder_decoder_model_output_attentions`, but with `output_attentions` triggered from the
         # config file. Contrarily to most models, changing the model's config won't work -- the defaults are loaded
@@ -491,7 +491,7 @@ class EncoderDecoderMixin:
         decoder_input_ids,
         decoder_attention_mask,
         labels,
-        **kwargs
+        **kwargs,
     ):
         torch.manual_seed(0)
         encoder_model, decoder_model = self.get_encoder_decoder_model(config, decoder_config)
@@ -610,6 +610,31 @@ class EncoderDecoderMixin:
     def test_encoder_decoder_model_shared_weights(self):
         input_ids_dict = self.prepare_config_and_inputs()
         self.create_and_check_encoder_decoder_shared_weights(**input_ids_dict)
+
+    def test_training_gradient_checkpointing(self):
+        inputs_dict = self.prepare_config_and_inputs()
+        encoder_model, decoder_model = self.get_encoder_decoder_model(
+            inputs_dict["config"], inputs_dict["decoder_config"]
+        )
+
+        model = EncoderDecoderModel(encoder=encoder_model, decoder=decoder_model)
+        model.to(torch_device)
+        model.gradient_checkpointing_enable()
+        model.train()
+
+        model.config.decoder_start_token_id = 0
+        model.config.pad_token_id = 0
+
+        model_inputs = {
+            "input_ids": inputs_dict["input_ids"],
+            "attention_mask": inputs_dict["attention_mask"],
+            "labels": inputs_dict["labels"],
+            "decoder_input_ids": inputs_dict["decoder_input_ids"],
+        }
+        model_inputs = {k: v.to(torch_device) for k, v in model_inputs.items()}
+
+        loss = model(**model_inputs).loss
+        loss.backward()
 
     @slow
     def test_real_model_save_load_from_pretrained(self):

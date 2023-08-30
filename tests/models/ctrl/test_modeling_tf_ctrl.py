@@ -14,6 +14,8 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
 import unittest
 
 from transformers import CTRLConfig, is_tf_available
@@ -21,6 +23,7 @@ from transformers.testing_utils import require_tf, slow
 
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_tf_common import TFModelTesterMixin, ids_tensor, random_attention_mask
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_tf_available():
@@ -49,7 +52,7 @@ class TFCTRLModelTester(object):
         self.use_mc_token_ids = True
         self.vocab_size = 99
         self.hidden_size = 32
-        self.num_hidden_layers = 5
+        self.num_hidden_layers = 2
         self.num_attention_heads = 4
         self.intermediate_size = 37
         self.hidden_act = "gelu"
@@ -92,7 +95,7 @@ class TFCTRLModelTester(object):
             n_embd=self.hidden_size,
             n_layer=self.num_hidden_layers,
             n_head=self.num_attention_heads,
-            # intermediate_size=self.intermediate_size,
+            dff=self.intermediate_size,
             # hidden_act=self.hidden_act,
             # hidden_dropout_prob=self.hidden_dropout_prob,
             # attention_probs_dropout_prob=self.attention_probs_dropout_prob,
@@ -168,12 +171,33 @@ class TFCTRLModelTester(object):
 
 
 @require_tf
-class TFCTRLModelTest(TFModelTesterMixin, unittest.TestCase):
-
+class TFCTRLModelTest(TFModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (TFCTRLModel, TFCTRLLMHeadModel, TFCTRLForSequenceClassification) if is_tf_available() else ()
     all_generative_model_classes = (TFCTRLLMHeadModel,) if is_tf_available() else ()
+    pipeline_model_mapping = (
+        {
+            "feature-extraction": TFCTRLModel,
+            "text-classification": TFCTRLForSequenceClassification,
+            "text-generation": TFCTRLLMHeadModel,
+            "zero-shot": TFCTRLForSequenceClassification,
+        }
+        if is_tf_available()
+        else {}
+    )
     test_head_masking = False
     test_onnx = False
+
+    # TODO: Fix the failed tests
+    def is_pipeline_test_to_skip(
+        self, pipeline_test_casse_name, config_class, model_architecture, tokenizer_name, processor_name
+    ):
+        if pipeline_test_casse_name == "ZeroShotClassificationPipelineTests":
+            # Get `tokenizer does not have a padding token` error for both fast/slow tokenizers.
+            # `CTRLConfig` was never used in pipeline tests, either because of a missing checkpoint or because a tiny
+            # config could not be created.
+            return True
+
+        return False
 
     def setUp(self):
         self.model_tester = TFCTRLModelTester(self)
@@ -201,6 +225,7 @@ class TFCTRLModelTest(TFModelTesterMixin, unittest.TestCase):
 
         for model_class in self.all_model_classes:
             model = model_class(config)
+            model.build()  # may be needed for the get_bias() call below
             assert isinstance(model.get_input_embeddings(), tf.keras.layers.Layer)
 
             if model_class in list_lm_models:

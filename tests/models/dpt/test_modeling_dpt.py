@@ -24,7 +24,8 @@ from transformers.models.auto import get_values
 from transformers.testing_utils import require_torch, require_vision, slow, torch_device
 
 from ...test_configuration_common import ConfigTester
-from ...test_modeling_common import ModelTesterMixin, floats_tensor, ids_tensor
+from ...test_modeling_common import ModelTesterMixin, _config_zero_init, floats_tensor, ids_tensor
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
@@ -38,7 +39,7 @@ if is_torch_available():
 if is_vision_available():
     from PIL import Image
 
-    from transformers import DPTFeatureExtractor
+    from transformers import DPTImageProcessor
 
 
 class DPTModelTester:
@@ -52,7 +53,7 @@ class DPTModelTester:
         is_training=True,
         use_labels=True,
         hidden_size=32,
-        num_hidden_layers=4,
+        num_hidden_layers=2,
         backbone_out_indices=[0, 1, 2, 3],
         num_attention_heads=4,
         intermediate_size=37,
@@ -61,6 +62,8 @@ class DPTModelTester:
         attention_probs_dropout_prob=0.1,
         initializer_range=0.02,
         num_labels=3,
+        neck_hidden_sizes=[16, 32],
+        is_hybrid=False,
         scope=None,
     ):
         self.parent = parent
@@ -81,6 +84,8 @@ class DPTModelTester:
         self.initializer_range = initializer_range
         self.num_labels = num_labels
         self.scope = scope
+        self.is_hybrid = is_hybrid
+        self.neck_hidden_sizes = neck_hidden_sizes
         # sequence length of DPT = num_patches + 1 (we add 1 for the [CLS] token)
         num_patches = (image_size // patch_size) ** 2
         self.seq_length = num_patches + 1
@@ -102,6 +107,7 @@ class DPTModelTester:
             patch_size=self.patch_size,
             num_channels=self.num_channels,
             hidden_size=self.hidden_size,
+            fusion_hidden_size=self.hidden_size,
             num_hidden_layers=self.num_hidden_layers,
             backbone_out_indices=self.backbone_out_indices,
             num_attention_heads=self.num_attention_heads,
@@ -111,6 +117,8 @@ class DPTModelTester:
             attention_probs_dropout_prob=self.attention_probs_dropout_prob,
             is_decoder=False,
             initializer_range=self.initializer_range,
+            is_hybrid=self.is_hybrid,
+            neck_hidden_sizes=self.neck_hidden_sizes,
         )
 
     def create_and_check_model(self, config, pixel_values, labels):
@@ -146,13 +154,22 @@ class DPTModelTester:
 
 
 @require_torch
-class DPTModelTest(ModelTesterMixin, unittest.TestCase):
+class DPTModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     """
     Here we also overwrite some of the tests of test_modeling_common.py, as DPT does not use input_ids, inputs_embeds,
     attention_mask and seq_length.
     """
 
     all_model_classes = (DPTModel, DPTForDepthEstimation, DPTForSemanticSegmentation) if is_torch_available() else ()
+    pipeline_model_mapping = (
+        {
+            "depth-estimation": DPTForDepthEstimation,
+            "feature-extraction": DPTModel,
+            "image-segmentation": DPTForSemanticSegmentation,
+        }
+        if is_torch_available()
+        else {}
+    )
 
     test_pruning = False
     test_resize_embeddings = False
@@ -239,6 +256,29 @@ class DPTModelTest(ModelTesterMixin, unittest.TestCase):
             loss = model(**inputs).loss
             loss.backward()
 
+    def test_initialization(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+
+        configs_no_init = _config_zero_init(config)
+        for model_class in self.all_model_classes:
+            model = model_class(config=configs_no_init)
+            # Skip the check for the backbone
+            backbone_params = []
+            for name, module in model.named_modules():
+                if module.__class__.__name__ == "DPTViTHybridEmbeddings":
+                    backbone_params = [f"{name}.{key}" for key in module.state_dict().keys()]
+                    break
+
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    if name in backbone_params:
+                        continue
+                    self.assertIn(
+                        ((param.data.mean() * 1e9).round() / 1e9).item(),
+                        [0.0, 1.0],
+                        msg=f"Parameter {name} of model {model_class} seems not properly initialized",
+                    )
+
     @slow
     def test_model_from_pretrained(self):
         for model_name in DPT_PRETRAINED_MODEL_ARCHIVE_LIST[:1]:
@@ -257,11 +297,11 @@ def prepare_img():
 @slow
 class DPTModelIntegrationTest(unittest.TestCase):
     def test_inference_depth_estimation(self):
-        feature_extractor = DPTFeatureExtractor.from_pretrained("Intel/dpt-large")
+        image_processor = DPTImageProcessor.from_pretrained("Intel/dpt-large")
         model = DPTForDepthEstimation.from_pretrained("Intel/dpt-large").to(torch_device)
 
         image = prepare_img()
-        inputs = feature_extractor(images=image, return_tensors="pt").to(torch_device)
+        inputs = image_processor(images=image, return_tensors="pt").to(torch_device)
 
         # forward pass
         with torch.no_grad():
@@ -279,11 +319,11 @@ class DPTModelIntegrationTest(unittest.TestCase):
         self.assertTrue(torch.allclose(outputs.predicted_depth[0, :3, :3], expected_slice, atol=1e-4))
 
     def test_inference_semantic_segmentation(self):
-        feature_extractor = DPTFeatureExtractor.from_pretrained("Intel/dpt-large-ade")
+        image_processor = DPTImageProcessor.from_pretrained("Intel/dpt-large-ade")
         model = DPTForSemanticSegmentation.from_pretrained("Intel/dpt-large-ade").to(torch_device)
 
         image = prepare_img()
-        inputs = feature_extractor(images=image, return_tensors="pt").to(torch_device)
+        inputs = image_processor(images=image, return_tensors="pt").to(torch_device)
 
         # forward pass
         with torch.no_grad():
@@ -300,11 +340,11 @@ class DPTModelIntegrationTest(unittest.TestCase):
         self.assertTrue(torch.allclose(outputs.logits[0, 0, :3, :3], expected_slice, atol=1e-4))
 
     def test_post_processing_semantic_segmentation(self):
-        feature_extractor = DPTFeatureExtractor.from_pretrained("Intel/dpt-large-ade")
+        image_processor = DPTImageProcessor.from_pretrained("Intel/dpt-large-ade")
         model = DPTForSemanticSegmentation.from_pretrained("Intel/dpt-large-ade").to(torch_device)
 
         image = prepare_img()
-        inputs = feature_extractor(images=image, return_tensors="pt").to(torch_device)
+        inputs = image_processor(images=image, return_tensors="pt").to(torch_device)
 
         # forward pass
         with torch.no_grad():
@@ -312,10 +352,10 @@ class DPTModelIntegrationTest(unittest.TestCase):
 
         outputs.logits = outputs.logits.detach().cpu()
 
-        segmentation = feature_extractor.post_process_semantic_segmentation(outputs=outputs, target_sizes=[(500, 300)])
+        segmentation = image_processor.post_process_semantic_segmentation(outputs=outputs, target_sizes=[(500, 300)])
         expected_shape = torch.Size((500, 300))
         self.assertEqual(segmentation[0].shape, expected_shape)
 
-        segmentation = feature_extractor.post_process_semantic_segmentation(outputs=outputs)
+        segmentation = image_processor.post_process_semantic_segmentation(outputs=outputs)
         expected_shape = torch.Size((480, 480))
         self.assertEqual(segmentation[0].shape, expected_shape)

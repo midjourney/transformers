@@ -14,6 +14,8 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
 import unittest
 
 from transformers import RobertaConfig, is_tf_available
@@ -21,6 +23,7 @@ from transformers.testing_utils import require_sentencepiece, require_tf, requir
 
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_tf_common import TFModelTesterMixin, floats_tensor, ids_tensor, random_attention_mask
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_tf_available():
@@ -53,7 +56,7 @@ class TFRobertaModelTester:
         self.use_labels = True
         self.vocab_size = 99
         self.hidden_size = 32
-        self.num_hidden_layers = 5
+        self.num_hidden_layers = 2
         self.num_attention_heads = 4
         self.intermediate_size = 37
         self.hidden_act = "gelu"
@@ -547,8 +550,7 @@ class TFRobertaModelTester:
 
 
 @require_tf
-class TFRobertaModelTest(TFModelTesterMixin, unittest.TestCase):
-
+class TFRobertaModelTest(TFModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (
         (
             TFRobertaModel,
@@ -560,6 +562,19 @@ class TFRobertaModelTest(TFModelTesterMixin, unittest.TestCase):
         )
         if is_tf_available()
         else ()
+    )
+    pipeline_model_mapping = (
+        {
+            "feature-extraction": TFRobertaModel,
+            "fill-mask": TFRobertaForMaskedLM,
+            "question-answering": TFRobertaForQuestionAnswering,
+            "text-classification": TFRobertaForSequenceClassification,
+            "text-generation": TFRobertaForCausalLM,
+            "token-classification": TFRobertaForTokenClassification,
+            "zero-shot": TFRobertaForSequenceClassification,
+        }
+        if is_tf_available()
+        else {}
     )
     test_head_masking = False
     test_onnx = False

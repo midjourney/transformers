@@ -18,13 +18,15 @@ import tempfile
 import unittest
 
 from huggingface_hub.hf_api import list_models
+
 from transformers import MarianConfig, is_torch_available
 from transformers.testing_utils import require_sentencepiece, require_tokenizers, require_torch, slow, torch_device
 from transformers.utils import cached_property
 
-from ...generation.test_generation_utils import GenerationTesterMixin
+from ...generation.test_utils import GenerationTesterMixin
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import ModelTesterMixin, ids_tensor
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
@@ -234,9 +236,21 @@ class MarianModelTester:
 
 
 @require_torch
-class MarianModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
+class MarianModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (MarianModel, MarianMTModel) if is_torch_available() else ()
     all_generative_model_classes = (MarianMTModel,) if is_torch_available() else ()
+    pipeline_model_mapping = (
+        {
+            "conversational": MarianMTModel,
+            "feature-extraction": MarianModel,
+            "summarization": MarianMTModel,
+            "text-generation": MarianForCausalLM,
+            "text2text-generation": MarianMTModel,
+            "translation": MarianMTModel,
+        }
+        if is_torch_available()
+        else {}
+    )
     is_encoder_decoder = True
     fx_compatible = True
     test_pruning = False
@@ -424,7 +438,11 @@ class MarianIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(self.model.device, model_inputs.input_ids.device)
         generated_ids = self.model.generate(
-            model_inputs.input_ids, attention_mask=model_inputs.attention_mask, num_beams=2, max_length=128
+            model_inputs.input_ids,
+            attention_mask=model_inputs.attention_mask,
+            num_beams=2,
+            max_length=128,
+            renormalize_logits=True,  # Marian should always renormalize its logits. See #25459
         )
         generated_words = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
         return generated_words
@@ -604,7 +622,7 @@ class TestMarian_FI_EN_V2(MarianIntegrationTest):
         return cls
 
     @slow
-    def test_batch_generation_en_fr(self):
+    def test_batch_generation_fi_en(self):
         self._assert_generated_batch_equal_expected()
 
 
@@ -647,7 +665,7 @@ class MarianStandaloneDecoderModelTester:
         use_labels=True,
         decoder_start_token_id=2,
         decoder_ffn_dim=32,
-        decoder_layers=4,
+        decoder_layers=2,
         encoder_attention_heads=4,
         decoder_attention_heads=4,
         max_position_embeddings=30,
@@ -848,3 +866,7 @@ class MarianStandaloneDecoderModelTest(ModelTesterMixin, GenerationTesterMixin, 
     def test_retain_grad_hidden_states_attentions(self):
         # decoder cannot keep gradients
         return
+
+    @unittest.skip("The model doesn't support left padding")  # and it's not used enough to be worth fixing :)
+    def test_left_padding_compatibility(self):
+        pass

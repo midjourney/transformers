@@ -14,8 +14,11 @@
 # limitations under the License.
 """ TensorFlow SegFormer model."""
 
+
+from __future__ import annotations
+
 import math
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import tensorflow as tf
 
@@ -37,7 +40,6 @@ logger = logging.get_logger(__name__)
 
 # General docstring
 _CONFIG_FOR_DOC = "SegformerConfig"
-_FEAT_EXTRACTOR_FOR_DOC = "SegformerFeatureExtractor"
 
 # Base docstring
 _CHECKPOINT_FOR_DOC = "nvidia/mit-b0"
@@ -108,7 +110,7 @@ class TFSegformerEfficientSelfAttention(tf.keras.layers.Layer):
         hidden_size: int,
         num_attention_heads: int,
         sequence_reduction_ratio: int,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self.hidden_size = hidden_size
@@ -214,7 +216,7 @@ class TFSegformerAttention(tf.keras.layers.Layer):
         hidden_size: int,
         num_attention_heads: int,
         sequence_reduction_ratio: int,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self.self = TFSegformerEfficientSelfAttention(
@@ -263,7 +265,7 @@ class TFSegformerMixFFN(tf.keras.layers.Layer):
         in_features: int,
         hidden_features: int = None,
         out_features: int = None,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
         out_features = out_features or in_features
@@ -297,7 +299,7 @@ class TFSegformerLayer(tf.keras.layers.Layer):
         drop_path: float,
         sequence_reduction_ratio: int,
         mlp_ratio: int,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self.layer_norm_1 = tf.keras.layers.LayerNormalization(epsilon=1e-05, name="layer_norm_1")
@@ -519,34 +521,8 @@ class TFSegformerPreTrainedModel(TFPreTrainedModel):
     main_input_name = "pixel_values"
 
     @property
-    def dummy_inputs(self) -> Dict[str, tf.Tensor]:
-        """
-        Dummy inputs to build the network.
-
-        Returns:
-            `Dict[str, tf.Tensor]`: The dummy inputs.
-        """
-        VISION_DUMMY_INPUTS = tf.random.uniform(shape=(3, self.config.num_channels, 512, 512), dtype=tf.float32)
-        return {"pixel_values": tf.constant(VISION_DUMMY_INPUTS)}
-
-    @tf.function(
-        input_signature=[
-            {
-                "pixel_values": tf.TensorSpec((None, None, None, None), tf.float32, name="pixel_values"),
-            }
-        ]
-    )
-    def serving(self, inputs):
-        """
-        Method used for serving the model.
-
-        Args:
-            inputs (`Dict[str, tf.Tensor]`):
-                The input of the saved model as a dictionary of tensors.
-        """
-        output = self.call(inputs)
-
-        return self.serving_output(output)
+    def input_signature(self):
+        return {"pixel_values": tf.TensorSpec(shape=(None, self.config.num_channels, 512, 512), dtype=tf.float32)}
 
 
 SEGFORMER_START_DOCSTRING = r"""
@@ -568,8 +544,8 @@ SEGFORMER_INPUTS_DOCSTRING = r"""
 
     Args:
         pixel_values (`np.ndarray`, `tf.Tensor`, `List[tf.Tensor]` ``Dict[str, tf.Tensor]` or `Dict[str, np.ndarray]` and each example must have the shape `(batch_size, num_channels, height, width)`):
-            Pixel values. Pixel values can be obtained using [`AutoFeatureExtractor`]. See
-            [`AutoFeatureExtractor.__call__`] for details.
+            Pixel values. Pixel values can be obtained using [`AutoImageProcessor`]. See
+            [`SegformerImageProcessor.__call__`] for details.
 
         output_attentions (`bool`, *optional*):
             Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
@@ -606,7 +582,6 @@ class TFSegformerModel(TFSegformerPreTrainedModel):
     @unpack_inputs
     @add_start_docstrings_to_model_forward(SEGFORMER_INPUTS_DOCSTRING.format("(batch_size, sequence_length)"))
     @add_code_sample_docstrings(
-        processor_class=_FEAT_EXTRACTOR_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFBaseModelOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -630,14 +605,6 @@ class TFSegformerModel(TFSegformerPreTrainedModel):
         )
         return outputs
 
-    def serving_output(self, output: TFBaseModelOutput) -> TFBaseModelOutput:
-        # hidden_states and attention not converted to Tensor with tf.convert_to_tensor as they are all of different dimensions
-        return TFBaseModelOutput(
-            last_hidden_state=output.last_hidden_state,
-            hidden_states=output.hidden_states,
-            attentions=output.attentions,
-        )
-
 
 @add_start_docstrings(
     """
@@ -659,7 +626,6 @@ class TFSegformerForImageClassification(TFSegformerPreTrainedModel, TFSequenceCl
     @unpack_inputs
     @add_start_docstrings_to_model_forward(SEGFORMER_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_FEAT_EXTRACTOR_FOR_DOC,
         checkpoint=_IMAGE_CLASS_CHECKPOINT,
         output_type=TFSequenceClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -667,8 +633,8 @@ class TFSegformerForImageClassification(TFSegformerPreTrainedModel, TFSequenceCl
     )
     def call(
         self,
-        pixel_values: Optional[tf.Tensor] = None,
-        labels: Optional[tf.Tensor] = None,
+        pixel_values: tf.Tensor | None = None,
+        labels: tf.Tensor | None = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -700,12 +666,6 @@ class TFSegformerForImageClassification(TFSegformerPreTrainedModel, TFSequenceCl
 
         return TFSequenceClassifierOutput(
             loss=loss, logits=logits, hidden_states=outputs.hidden_states, attentions=outputs.attentions
-        )
-
-    def serving_output(self, output: TFSequenceClassifierOutput) -> TFSequenceClassifierOutput:
-        # hidden_states and attention not converted to Tensor with tf.convert_to_tensor as they are all of different dimensions
-        return TFSequenceClassifierOutput(
-            logits=output.logits, hidden_states=output.hidden_states, attentions=output.attentions
         )
 
 
@@ -741,7 +701,7 @@ class TFSegformerDecodeHead(TFSegformerPreTrainedModel):
         self.linear_fuse = tf.keras.layers.Conv2D(
             filters=config.decoder_hidden_size, kernel_size=1, use_bias=False, name="linear_fuse"
         )
-        self.batch_norm = tf.keras.layers.BatchNormalization(epsilon=1e-5, momentum=0.1, name="batch_norm")
+        self.batch_norm = tf.keras.layers.BatchNormalization(epsilon=1e-5, momentum=0.9, name="batch_norm")
         self.activation = tf.keras.layers.Activation("relu")
 
         self.dropout = tf.keras.layers.Dropout(config.classifier_dropout_prob)
@@ -750,21 +710,20 @@ class TFSegformerDecodeHead(TFSegformerPreTrainedModel):
         self.config = config
 
     def call(self, encoder_hidden_states, training: bool = False):
-        batch_size = shape_list(encoder_hidden_states[-1])[0]
-
         all_hidden_states = ()
         for encoder_hidden_state, mlp in zip(encoder_hidden_states, self.mlps):
             if self.config.reshape_last_stage is False and len(shape_list(encoder_hidden_state)) == 3:
                 height = tf.math.sqrt(tf.cast(shape_list(encoder_hidden_state)[1], tf.float32))
                 height = width = tf.cast(height, tf.int32)
-                encoder_hidden_state = tf.reshape(encoder_hidden_state, (batch_size, height, width, -1))
+                channel_dim = shape_list(encoder_hidden_state)[-1]
+                encoder_hidden_state = tf.reshape(encoder_hidden_state, (-1, height, width, channel_dim))
 
             # unify channel dimension
             encoder_hidden_state = tf.transpose(encoder_hidden_state, perm=[0, 2, 3, 1])
-            height = shape_list(encoder_hidden_state)[1]
-            width = shape_list(encoder_hidden_state)[2]
+            height, width = shape_list(encoder_hidden_state)[1:3]
             encoder_hidden_state = mlp(encoder_hidden_state)
-            encoder_hidden_state = tf.reshape(encoder_hidden_state, (batch_size, height, width, -1))
+            channel_dim = shape_list(encoder_hidden_state)[-1]
+            encoder_hidden_state = tf.reshape(encoder_hidden_state, (-1, height, width, channel_dim))
 
             # upsample
             temp_state = tf.transpose(encoder_hidden_states[0], perm=[0, 2, 3, 1])
@@ -819,7 +778,7 @@ class TFSegformerForSemanticSegmentation(TFSegformerPreTrainedModel):
     def call(
         self,
         pixel_values: tf.Tensor,
-        labels: Optional[tf.Tensor] = None,
+        labels: tf.Tensor | None = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -835,17 +794,17 @@ class TFSegformerForSemanticSegmentation(TFSegformerPreTrainedModel):
         Examples:
 
         ```python
-        >>> from transformers import SegformerFeatureExtractor, TFSegformerForSemanticSegmentation
+        >>> from transformers import AutoImageProcessor, TFSegformerForSemanticSegmentation
         >>> from PIL import Image
         >>> import requests
 
         >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
         >>> image = Image.open(requests.get(url, stream=True).raw)
 
-        >>> feature_extractor = SegformerFeatureExtractor.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
+        >>> image_processor = AutoImageProcessor.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
         >>> model = TFSegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b0-finetuned-ade-512-512")
 
-        >>> inputs = feature_extractor(images=image, return_tensors="tf")
+        >>> inputs = image_processor(images=image, return_tensors="tf")
         >>> outputs = model(**inputs, training=False)
         >>> # logits are of shape (batch_size, num_labels, height/4, width/4)
         >>> logits = outputs.logits
@@ -891,10 +850,4 @@ class TFSegformerForSemanticSegmentation(TFSegformerPreTrainedModel):
             logits=logits,
             hidden_states=outputs.hidden_states if output_hidden_states else None,
             attentions=outputs.attentions,
-        )
-
-    def serving_output(self, output: TFSemanticSegmenterOutput) -> TFSemanticSegmenterOutput:
-        # hidden_states and attention not converted to Tensor with tf.convert_to_tensor as they are all of different dimensions
-        return TFSemanticSegmenterOutput(
-            logits=output.logits, hidden_states=output.hidden_states, attentions=output.attentions
         )

@@ -35,6 +35,7 @@ from torch import nn
 from torch.utils.data import Dataset, IterableDataset, RandomSampler, Sampler
 from torch.utils.data.distributed import DistributedSampler
 
+from .integrations.deepspeed import is_deepspeed_zero3_enabled
 from .tokenization_utils_base import BatchEncoding
 from .utils import is_sagemaker_mp_enabled, is_torch_tpu_available, is_training_run_on_sagemaker, logging
 
@@ -104,7 +105,7 @@ def numpy_pad_and_concatenate(array1, array2, padding_index=-100):
 def nested_concat(tensors, new_tensors, padding_index=-100):
     """
     Concat the `new_tensors` to `tensors` on the first dim and pad them on the second if needed. Works for tensors or
-    nested list/tuples of tensors.
+    nested list/tuples/dict of tensors.
     """
     assert type(tensors) == type(
         new_tensors
@@ -113,6 +114,10 @@ def nested_concat(tensors, new_tensors, padding_index=-100):
         return type(tensors)(nested_concat(t, n, padding_index=padding_index) for t, n in zip(tensors, new_tensors))
     elif isinstance(tensors, torch.Tensor):
         return torch_pad_and_concatenate(tensors, new_tensors, padding_index=padding_index)
+    elif isinstance(tensors, Mapping):
+        return type(tensors)(
+            {k: nested_concat(t, new_tensors[k], padding_index=padding_index) for k, t in tensors.items()}
+        )
     elif isinstance(tensors, np.ndarray):
         return numpy_pad_and_concatenate(tensors, new_tensors, padding_index=padding_index)
     else:
@@ -140,9 +145,12 @@ def find_batch_size(tensors):
 
 
 def nested_numpify(tensors):
-    "Numpify `tensors` (even if it's a nested list/tuple of tensors)."
+    "Numpify `tensors` (even if it's a nested list/tuple/dict of tensors)."
     if isinstance(tensors, (list, tuple)):
         return type(tensors)(nested_numpify(t) for t in tensors)
+    if isinstance(tensors, Mapping):
+        return type(tensors)({k: nested_numpify(t) for k, t in tensors.items()})
+
     t = tensors.cpu()
     if t.dtype == torch.bfloat16:
         # As of Numpy 1.21.4, NumPy does not support bfloat16 (see
@@ -153,9 +161,11 @@ def nested_numpify(tensors):
 
 
 def nested_detach(tensors):
-    "Detach `tensors` (even if it's a nested list/tuple of tensors)."
+    "Detach `tensors` (even if it's a nested list/tuple/dict of tensors)."
     if isinstance(tensors, (list, tuple)):
         return type(tensors)(nested_detach(t) for t in tensors)
+    elif isinstance(tensors, Mapping):
+        return type(tensors)({k: nested_detach(t) for k, t in tensors.items()})
     return tensors.detach()
 
 
@@ -165,6 +175,11 @@ def nested_xla_mesh_reduce(tensors, name):
 
         if isinstance(tensors, (list, tuple)):
             return type(tensors)(nested_xla_mesh_reduce(t, f"{name}_{i}") for i, t in enumerate(tensors))
+        if isinstance(tensors, Mapping):
+            return type(tensors)(
+                {k: nested_xla_mesh_reduce(t, f"{name}_{i}") for i, (k, t) in enumerate(tensors.items())}
+            )
+
         tensors = atleast_1d(tensors)
         return xm.mesh_reduce(name, tensors, torch.cat)
     else:
@@ -175,7 +190,9 @@ def distributed_concat(tensor: Any, num_total_examples: Optional[int] = None) ->
     try:
         if isinstance(tensor, (tuple, list)):
             return type(tensor)(distributed_concat(t, num_total_examples) for t in tensor)
-        tensor = atleast_1d(tensor)
+        if isinstance(tensor, Mapping):
+            return type(tensor)({k: distributed_concat(t, num_total_examples) for k, t in tensor.items()})
+        tensor = atleast_1d(tensor).contiguous()
         output_tensors = [tensor.clone() for _ in range(dist.get_world_size())]
         dist.all_gather(output_tensors, tensor)
         concat = torch.cat(output_tensors, dim=0)
@@ -240,7 +257,7 @@ class DistributedSamplerWithLoop(DistributedSampler):
             Dataset used for sampling.
         batch_size (`int`):
             The batch size used with this sampler
-        kwargs:
+        kwargs (`Dict[str, Any]`, *optional*):
             All other keyword arguments passed to `DistributedSampler`.
     """
 
@@ -335,9 +352,12 @@ def expand_like(arrays, new_seq_length, padding_index=-100):
 
 
 def nested_truncate(tensors, limit):
-    "Truncate `tensors` at `limit` (even if it's a nested list/tuple of tensors)."
+    "Truncate `tensors` at `limit` (even if it's a nested list/tuple/dict of tensors)."
     if isinstance(tensors, (list, tuple)):
         return type(tensors)(nested_truncate(t, limit) for t in tensors)
+    if isinstance(tensors, Mapping):
+        return type(tensors)({k: nested_truncate(t, limit) for k, t in tensors.items()})
+
     return tensors[:limit]
 
 
@@ -515,7 +535,7 @@ def get_length_grouped_indices(lengths, batch_size, mega_batch_mult=None, genera
     indices = torch.randperm(len(lengths), generator=generator)
     megabatch_size = mega_batch_mult * batch_size
     megabatches = [indices[i : i + megabatch_size].tolist() for i in range(0, len(lengths), megabatch_size)]
-    megabatches = [list(sorted(megabatch, key=lambda i: lengths[i], reverse=True)) for megabatch in megabatches]
+    megabatches = [sorted(megabatch, key=lambda i: lengths[i], reverse=True) for megabatch in megabatches]
 
     # The rest is to get the biggest batch first.
     # Since each megabatch is sorted by descending length, the longest element is the first
@@ -578,6 +598,7 @@ class DistributedLengthGroupedSampler(DistributedSampler):
     Distributed Sampler that samples indices in a way that groups together features of the dataset of roughly the same
     length while keeping a bit of randomness.
     """
+
     # Copied and adapted from PyTorch DistributedSampler.
     def __init__(
         self,
@@ -817,7 +838,7 @@ class IterableDatasetShard(IterableDataset):
 
 
 def _get_learning_rate(self):
-    if self.deepspeed:
+    if self.is_deepspeed_enabled:
         # with deepspeed's fp16 and dynamic loss scale enabled the optimizer/scheduler steps may
         # not run for the first few dozen steps while loss scale is too large, and thus during
         # that time `get_last_lr` will fail if called during that warm up stage, so work around it:
@@ -830,7 +851,10 @@ def _get_learning_rate(self):
             else:
                 raise
     else:
-        last_lr = self.lr_scheduler.get_last_lr()[0]
+        if isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+            last_lr = self.optimizer.param_groups[0]["lr"]
+        else:
+            last_lr = self.lr_scheduler.get_last_lr()[0]
         if torch.is_tensor(last_lr):
             last_lr = last_lr.item()
     return last_lr
@@ -1010,6 +1034,23 @@ def save_state(self):
 
     path = os.path.join(self.args.output_dir, "trainer_state.json")
     self.state.save_to_json(path)
+
+
+def get_model_param_count(model, trainable_only=False):
+    """
+    Calculate model's total param count. If trainable_only is True then count only those requiring grads
+    """
+    if is_deepspeed_zero3_enabled():
+
+        def numel(p):
+            return p.ds_numel if hasattr(p, "ds_numel") else p.numel()
+
+    else:
+
+        def numel(p):
+            return p.numel()
+
+    return sum(numel(p) for p in model.parameters() if not trainable_only or p.requires_grad)
 
 
 def get_parameter_names(model, forbidden_layer_types):

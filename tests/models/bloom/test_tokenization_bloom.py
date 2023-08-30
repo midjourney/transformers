@@ -25,7 +25,6 @@ from ...test_tokenization_common import TokenizerTesterMixin
 
 @require_tokenizers
 class BloomTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
-
     slow_tokenizer_class = None
     rust_tokenizer_class = BloomTokenizerFast
     tokenizer_class = BloomTokenizerFast
@@ -125,7 +124,7 @@ class BloomTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         input_text = list(sample_data.values())
 
         output_tokens = list(map(tokenizer.encode, input_text))
-        predicted_text = list(map(lambda x: tokenizer.decode(x, clean_up_tokenization_spaces=False), output_tokens))
+        predicted_text = [tokenizer.decode(x, clean_up_tokenization_spaces=False) for x in output_tokens]
         self.assertListEqual(predicted_text, input_text)
 
     def test_pretrained_model_lists(self):
@@ -134,3 +133,10 @@ class BloomTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         # maximum sequence length of the positoonal embeddings.
         self.assertGreaterEqual(len(self.tokenizer_class.pretrained_vocab_files_map), 1)
         self.assertGreaterEqual(len(list(self.tokenizer_class.pretrained_vocab_files_map.values())[0]), 1)
+
+    def test_add_prefix_space_fast(self):
+        tokenizer_w_prefix = self.get_rust_tokenizer(add_prefix_space=True)
+        tokenizer_wo_prefix = self.get_rust_tokenizer(add_prefix_space=False)
+        tokens_w_prefix = tokenizer_w_prefix.tokenize("Hey")
+        tokens_wo_prefix = tokenizer_wo_prefix.tokenize("Hey")
+        self.assertNotEqual(tokens_w_prefix, tokens_wo_prefix)

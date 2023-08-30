@@ -260,7 +260,7 @@ CTRL_INPUTS_DOCSTRING = r"""
             If `past_key_values` is used, only input IDs that do not have their past calculated should be passed as
             `input_ids`.
 
-            Indices can be obtained using [`CTRLTokenizer`]. See [`PreTrainedTokenizer.__call__`] and
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.__call__`] and
             [`PreTrainedTokenizer.encode`] for details.
 
             [What are input IDs?](../glossary#input-ids)
@@ -371,10 +371,10 @@ class CTRLModel(CTRLPreTrainedModel):
         Example:
 
         ```python
-        >>> from transformers import CTRLTokenizer, CTRLModel
+        >>> from transformers import AutoTokenizer, CTRLModel
         >>> import torch
 
-        >>> tokenizer = CTRLTokenizer.from_pretrained("ctrl")
+        >>> tokenizer = AutoTokenizer.from_pretrained("ctrl")
         >>> model = CTRLModel.from_pretrained("ctrl")
 
         >>> # CTRL was trained with control codes as the first token
@@ -397,6 +397,7 @@ class CTRLModel(CTRLPreTrainedModel):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
+            self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
             input_shape = input_ids.size()
             input_ids = input_ids.view(-1, input_shape[-1])
             batch_size = input_ids.shape[0]
@@ -456,7 +457,9 @@ class CTRLModel(CTRLPreTrainedModel):
 
         inputs_embeds *= np.sqrt(self.d_model_size)
 
-        pos_embeds = self.pos_encoding[position_ids, :].to(device)
+        # `self.pos_encoding` won't be sent to the correct device along the model, so we do it manually.
+        self.pos_encoding = self.pos_encoding.to(device)
+        pos_embeds = self.pos_encoding[position_ids, :]
 
         hidden_states = inputs_embeds + pos_embeds + token_type_embeds
 
@@ -507,6 +510,8 @@ class CTRLModel(CTRLPreTrainedModel):
     CTRL_START_DOCSTRING,
 )
 class CTRLLMHeadModel(CTRLPreTrainedModel):
+    _tied_weights_keys = ["lm_head.weight"]
+
     def __init__(self, config):
         super().__init__(config)
         self.transformer = CTRLModel(config)
@@ -521,12 +526,12 @@ class CTRLLMHeadModel(CTRLPreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
 
-    def prepare_inputs_for_generation(self, input_ids, past=None, use_cache=None, **kwargs):
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, use_cache=None, **kwargs):
         # only last token for inputs_ids if past is defined in kwargs
-        if past:
+        if past_key_values:
             input_ids = input_ids[:, -1].unsqueeze(-1)
 
-        return {"input_ids": input_ids, "past_key_values": past, "use_cache": use_cache}
+        return {"input_ids": input_ids, "past_key_values": past_key_values, "use_cache": use_cache}
 
     @add_start_docstrings_to_model_forward(CTRL_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=CausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
@@ -557,9 +562,9 @@ class CTRLLMHeadModel(CTRLPreTrainedModel):
 
         ```python
         >>> import torch
-        >>> from transformers import CTRLTokenizer, CTRLLMHeadModel
+        >>> from transformers import AutoTokenizer, CTRLLMHeadModel
 
-        >>> tokenizer = CTRLTokenizer.from_pretrained("ctrl")
+        >>> tokenizer = AutoTokenizer.from_pretrained("ctrl")
         >>> model = CTRLLMHeadModel.from_pretrained("ctrl")
 
         >>> # CTRL was trained with control codes as the first token
@@ -620,7 +625,9 @@ class CTRLLMHeadModel(CTRLPreTrainedModel):
         )
 
     @staticmethod
-    def _reorder_cache(past: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor) -> Tuple[Tuple[torch.Tensor]]:
+    def _reorder_cache(
+        past_key_values: Tuple[Tuple[torch.Tensor]], beam_idx: torch.Tensor
+    ) -> Tuple[Tuple[torch.Tensor]]:
         """
         This function is used to re-order the `past_key_values` cache if [`~PreTrainedModel.beam_search`] or
         [`~PreTrainedModel.beam_sample`] is called. This is required to match `past_key_values` with the correct
@@ -628,7 +635,7 @@ class CTRLLMHeadModel(CTRLPreTrainedModel):
         """
         return tuple(
             tuple(past_state.index_select(0, beam_idx.to(past_state.device)) for past_state in layer_past)
-            for layer_past in past
+            for layer_past in past_key_values
         )
 
 
@@ -683,9 +690,9 @@ class CTRLForSequenceClassification(CTRLPreTrainedModel):
 
         ```python
         >>> import torch
-        >>> from transformers import CTRLTokenizer, CTRLForSequenceClassification
+        >>> from transformers import AutoTokenizer, CTRLForSequenceClassification
 
-        >>> tokenizer = CTRLTokenizer.from_pretrained("ctrl")
+        >>> tokenizer = AutoTokenizer.from_pretrained("ctrl")
         >>> model = CTRLForSequenceClassification.from_pretrained("ctrl")
 
         >>> # CTRL was trained with control codes as the first token
@@ -718,9 +725,9 @@ class CTRLForSequenceClassification(CTRLPreTrainedModel):
 
         ```python
         >>> import torch
-        >>> from transformers import CTRLTokenizer, CTRLForSequenceClassification
+        >>> from transformers import AutoTokenizer, CTRLForSequenceClassification
 
-        >>> tokenizer = CTRLTokenizer.from_pretrained("ctrl")
+        >>> tokenizer = AutoTokenizer.from_pretrained("ctrl")
         >>> model = CTRLForSequenceClassification.from_pretrained("ctrl", problem_type="multi_label_classification")
 
         >>> # CTRL was trained with control codes as the first token
@@ -779,7 +786,9 @@ class CTRLForSequenceClassification(CTRLPreTrainedModel):
             sequence_lengths = -1
         else:
             if input_ids is not None:
-                sequence_lengths = torch.ne(input_ids, self.config.pad_token_id).sum(-1) - 1
+                sequence_lengths = (torch.eq(input_ids, self.config.pad_token_id).long().argmax(-1) - 1).to(
+                    logits.device
+                )
             else:
                 sequence_lengths = -1
                 logger.warning(

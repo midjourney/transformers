@@ -22,8 +22,8 @@ import tempfile
 import unittest
 
 import numpy as np
-
 import requests
+
 from transformers import (
     FlavaConfig,
     FlavaImageCodebookConfig,
@@ -42,6 +42,7 @@ from ...test_modeling_common import (
     ids_tensor,
     random_attention_mask,
 )
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
@@ -78,7 +79,7 @@ class FlavaImageModelTester:
         parent,
         batch_size=12,
         hidden_size=32,
-        num_hidden_layers=5,
+        num_hidden_layers=2,
         num_attention_heads=4,
         intermediate_size=37,
         hidden_act="gelu",
@@ -91,7 +92,7 @@ class FlavaImageModelTester:
         num_channels=3,
         qkv_bias=True,
         mask_token=True,
-        vocab_size=8192,
+        vocab_size=99,
     ):
         self.parent = parent
         self.batch_size = batch_size
@@ -336,12 +337,12 @@ class FlavaTextModelTester:
         is_training=True,
         use_input_mask=True,
         use_token_type_ids=True,
-        vocab_size=30522,
+        vocab_size=102,
         type_vocab_size=2,
         max_position_embeddings=512,
         position_embedding_type="absolute",
         hidden_size=32,
-        num_hidden_layers=5,
+        num_hidden_layers=2,
         num_attention_heads=4,
         intermediate_size=37,
         hidden_act="gelu",
@@ -435,7 +436,6 @@ class FlavaTextModelTester:
 
 @require_torch
 class FlavaTextModelTest(ModelTesterMixin, unittest.TestCase):
-
     all_model_classes = (FlavaTextModel,) if is_torch_available() else ()
     test_pruning = False
     test_head_masking = False
@@ -487,7 +487,7 @@ class FlavaMultimodalModelTester:
         seq_length=44,
         use_input_mask=True,
         hidden_size=32,
-        num_hidden_layers=5,
+        num_hidden_layers=2,
         num_attention_heads=4,
         intermediate_size=37,
         hidden_act="gelu",
@@ -569,7 +569,6 @@ class FlavaMultimodalModelTester:
 
 @require_torch
 class FlavaMultimodalModelTest(ModelTesterMixin, unittest.TestCase):
-
     all_model_classes = (FlavaMultimodalModel,) if is_torch_available() else ()
     test_pruning = False
     test_head_masking = False
@@ -633,11 +632,23 @@ class FlavaMultimodalModelTest(ModelTesterMixin, unittest.TestCase):
 
 
 class FlavaImageCodebookTester:
-    def __init__(self, parent, batch_size=12, image_size=112, num_channels=3):
+    def __init__(
+        self,
+        parent,
+        batch_size=12,
+        image_size=112,
+        num_channels=3,
+        hidden_size=32,
+        num_groups=2,
+        vocab_size=99,
+    ):
         self.parent = parent
         self.batch_size = batch_size
         self.image_size = image_size
         self.num_channels = num_channels
+        self.hidden_size = hidden_size
+        self.num_groups = num_groups
+        self.vocab_size = vocab_size
 
     def prepare_config_and_inputs(self):
         pixel_values = floats_tensor([self.batch_size, self.num_channels, self.image_size, self.image_size])
@@ -646,7 +657,9 @@ class FlavaImageCodebookTester:
         return config, pixel_values
 
     def get_config(self):
-        return FlavaImageCodebookConfig()
+        return FlavaImageCodebookConfig(
+            hidden_size=self.hidden_size, num_groups=self.num_groups, vocab_size=self.vocab_size
+        )
 
     def create_and_check_model(self, config, pixel_values):
         model = FlavaImageCodebook(config=config)
@@ -667,7 +680,6 @@ class FlavaImageCodebookTester:
 
 @require_torch
 class FlavaImageCodebookTest(ModelTesterMixin, unittest.TestCase):
-
     all_model_classes = (FlavaImageCodebook,) if is_torch_available() else ()
     test_pruning = False
     test_head_masking = False
@@ -746,17 +758,30 @@ class FlavaModelTester:
     def __init__(
         self,
         parent,
+        text_kwargs=None,
+        image_kwargs=None,
+        multimodal_kwargs=None,
+        image_codebook_kwargs=None,
         is_training=True,
         hidden_size=32,
         projection_dim=32,
         initializer_range=0.02,
         layer_norm_eps=1e-12,
     ):
+        if text_kwargs is None:
+            text_kwargs = {}
+        if image_kwargs is None:
+            image_kwargs = {}
+        if multimodal_kwargs is None:
+            multimodal_kwargs = {}
+        if image_codebook_kwargs is None:
+            image_codebook_kwargs = {}
+
         self.parent = parent
-        self.image_model_tester = FlavaImageModelTester(parent)
-        self.text_model_tester = FlavaTextModelTester(parent)
-        self.multimodal_model_tester = FlavaMultimodalModelTester(parent)
-        self.image_codebook_tester = FlavaImageCodebookTester(parent)
+        self.image_model_tester = FlavaImageModelTester(parent, **image_kwargs)
+        self.text_model_tester = FlavaTextModelTester(parent, **text_kwargs)
+        self.multimodal_model_tester = FlavaMultimodalModelTester(parent, **multimodal_kwargs)
+        self.image_codebook_tester = FlavaImageCodebookTester(parent, **image_codebook_kwargs)
         self.is_training = is_training
         self.config_tester = ConfigTester(self, config_class=FlavaConfig, hidden_size=37)
         self.hidden_size = hidden_size
@@ -846,8 +871,9 @@ class FlavaModelTester:
 
 
 @require_torch
-class FlavaModelTest(ModelTesterMixin, unittest.TestCase):
+class FlavaModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (FlavaModel,) if is_torch_available() else ()
+    pipeline_model_mapping = {"feature-extraction": FlavaModel} if is_torch_available() else {}
     class_for_tester = FlavaModelTester
     test_head_masking = False
     test_pruning = False
@@ -952,7 +978,27 @@ class FlavaModelTest(ModelTesterMixin, unittest.TestCase):
             # Non persistent buffers won't be in original state dict
             loaded_model_state_dict.pop("text_model.embeddings.token_type_ids", None)
 
+            non_persistent_buffers = {}
+            for key in loaded_model_state_dict.keys():
+                if key not in model_state_dict.keys():
+                    non_persistent_buffers[key] = loaded_model_state_dict[key]
+
+            loaded_model_state_dict = {
+                key: value for key, value in loaded_model_state_dict.items() if key not in non_persistent_buffers
+            }
+
             self.assertEqual(set(model_state_dict.keys()), set(loaded_model_state_dict.keys()))
+
+            model_buffers = list(model.buffers())
+            for non_persistent_buffer in non_persistent_buffers.values():
+                found_buffer = False
+                for i, model_buffer in enumerate(model_buffers):
+                    if torch.equal(non_persistent_buffer, model_buffer):
+                        found_buffer = True
+                        break
+
+                self.assertTrue(found_buffer)
+                model_buffers.pop(i)
 
             models_equal = True
             for layer_name, p1 in model_state_dict.items():

@@ -35,6 +35,8 @@ from .utils import (
     is_tf_available,
     is_torch_available,
     is_torch_cuda_available,
+    is_torch_mps_available,
+    is_torch_npu_available,
     is_torch_tpu_available,
     requires_backends,
 )
@@ -55,7 +57,7 @@ def seed_worker(_):
     set_seed(worker_seed)
 
 
-def enable_full_determinism(seed: int):
+def enable_full_determinism(seed: int, warn_only: bool = False):
     """
     Helper function for reproducible behavior during distributed training. See
     - https://pytorch.org/docs/stable/notes/randomness.html for pytorch
@@ -65,12 +67,12 @@ def enable_full_determinism(seed: int):
     set_seed(seed)
 
     if is_torch_available():
-        #  Enable PyTorch deterministic mode. This potentially requires either the environment
-        #  variable 'CUDA_LAUNCH_BLOCKING' or 'CUBLAS_WORKSPACE_CONFIG' to be set,
+        # Enable PyTorch deterministic mode. This potentially requires either the environment
+        # variable 'CUDA_LAUNCH_BLOCKING' or 'CUBLAS_WORKSPACE_CONFIG' to be set,
         # depending on the CUDA version, so we set them both here
         os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":16:8"
-        torch.use_deterministic_algorithms(True)
+        torch.use_deterministic_algorithms(True, warn_only=warn_only)
 
         # Enable CUDNN deterministic mode
         torch.backends.cudnn.deterministic = True
@@ -93,6 +95,8 @@ def set_seed(seed: int):
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         # ^^ safe to call this function even if cuda is not available
+    if is_torch_npu_available():
+        torch.npu.manual_seed_all(seed)
     if is_tf_available():
         tf.random.set_seed(seed)
 
@@ -192,7 +196,7 @@ class HubStrategy(ExplicitEnum):
 
 class BestRun(NamedTuple):
     """
-    The best run found by an hyperparameter search (see [`~Trainer.hyperparameter_search`]).
+    The best run found by a hyperparameter search (see [`~Trainer.hyperparameter_search`]).
 
     Parameters:
         run_id (`str`):
@@ -202,11 +206,14 @@ class BestRun(NamedTuple):
             The objective that was obtained for this run.
         hyperparameters (`Dict[str, Any]`):
             The hyperparameters picked to get this run.
+        run_summary (`Optional[Any]`):
+            A summary of tuning experiments. `ray.tune.ExperimentAnalysis` object for Ray backend.
     """
 
     run_id: str
     objective: float
     hyperparameters: Dict[str, Any]
+    run_summary: Optional[Any] = None
 
 
 def default_compute_objective(metrics: Dict[str, float]) -> float:
@@ -224,7 +231,11 @@ def default_compute_objective(metrics: Dict[str, float]) -> float:
     loss = metrics.pop("eval_loss", None)
     _ = metrics.pop("epoch", None)
     # Remove speed metrics
-    speed_metrics = [m for m in metrics.keys() if m.endswith("_runtime") or m.endswith("_per_second")]
+    speed_metrics = [
+        m
+        for m in metrics.keys()
+        if m.endswith("_runtime") or m.endswith("_per_second") or m.endswith("_compilation_time")
+    ]
     for sm in speed_metrics:
         _ = metrics.pop(sm, None)
     return loss if len(metrics) == 0 else sum(metrics.values())
@@ -294,14 +305,6 @@ class HPSearchBackend(ExplicitEnum):
     WANDB = "wandb"
 
 
-default_hp_space = {
-    HPSearchBackend.OPTUNA: default_hp_space_optuna,
-    HPSearchBackend.RAY: default_hp_space_ray,
-    HPSearchBackend.SIGOPT: default_hp_space_sigopt,
-    HPSearchBackend.WANDB: default_hp_space_wandb,
-}
-
-
 def is_main_process(local_rank):
     """
     Whether or not the current process is the local process, based on `xm.get_ordinal()` (for TPUs) first, then on
@@ -343,6 +346,8 @@ def speed_metrics(split, start_time, num_samples=None, num_steps=None):
     """
     runtime = time.time() - start_time
     result = {f"{split}_runtime": round(runtime, 4)}
+    if runtime == 0:
+        return result
     if num_samples is not None:
         samples_per_second = num_samples / runtime
         result[f"{split}_samples_per_second"] = round(samples_per_second, 3)
@@ -359,6 +364,8 @@ class SchedulerType(ExplicitEnum):
     POLYNOMIAL = "polynomial"
     CONSTANT = "constant"
     CONSTANT_WITH_WARMUP = "constant_with_warmup"
+    INVERSE_SQRT = "inverse_sqrt"
+    REDUCE_ON_PLATEAU = "reduce_lr_on_plateau"
 
 
 class TrainerMemoryTracker:
@@ -394,7 +401,6 @@ class TrainerMemoryTracker:
     }
 
     def __init__(self, skip_memory_metrics=False):
-
         self.skip_memory_metrics = skip_memory_metrics
 
         if not is_psutil_available():
@@ -407,6 +413,11 @@ class TrainerMemoryTracker:
         import psutil  # noqa
 
         if is_torch_cuda_available():
+            import torch
+
+            self.torch = torch
+            self.gpu = {}
+        elif is_torch_mps_available():
             import torch
 
             self.torch = torch
@@ -501,21 +512,21 @@ class TrainerMemoryTracker:
         if self.torch is not None:
             self.gpu_mem_used_now = self.torch.cuda.memory_allocated()
             self.gpu_mem_used_peak = self.torch.cuda.max_memory_allocated()
-            self.gpu[self.cur_stage] = dict(
-                begin=self.gpu_mem_used_at_start,
-                end=self.gpu_mem_used_now,
-                alloc=(self.gpu_mem_used_now - self.gpu_mem_used_at_start),
-                peaked=max(0, self.gpu_mem_used_peak - self.gpu_mem_used_now),
-            )
+            self.gpu[self.cur_stage] = {
+                "begin": self.gpu_mem_used_at_start,
+                "end": self.gpu_mem_used_now,
+                "alloc": (self.gpu_mem_used_now - self.gpu_mem_used_at_start),
+                "peaked": max(0, self.gpu_mem_used_peak - self.gpu_mem_used_now),
+            }
 
         # cpu
         self.cpu_mem_used_now = self.cpu_mem_used()
-        self.cpu[self.cur_stage] = dict(
-            begin=self.cpu_mem_used_at_start,
-            end=self.cpu_mem_used_now,
-            alloc=(self.cpu_mem_used_now - self.cpu_mem_used_at_start),
-            peaked=max(0, self.cpu_mem_used_peak - self.cpu_mem_used_now),
-        )
+        self.cpu[self.cur_stage] = {
+            "begin": self.cpu_mem_used_at_start,
+            "end": self.cpu_mem_used_now,
+            "alloc": (self.cpu_mem_used_now - self.cpu_mem_used_at_start),
+            "peaked": max(0, self.cpu_mem_used_peak - self.cpu_mem_used_now),
+        }
 
         # reset - cycle finished
         self.cur_stage = None
@@ -642,9 +653,9 @@ def find_executable_batch_size(
 
     if auto_find_batch_size:
         requires_backends(find_executable_batch_size, "accelerate")
-        import accelerate.memory_utils as mem_utils
+        from accelerate.utils import find_executable_batch_size as accelerate_find_executable_batch_size
 
-        return mem_utils.find_executable_batch_size(function=function, starting_batch_size=starting_batch_size)
+        return accelerate_find_executable_batch_size(function=function, starting_batch_size=starting_batch_size)
 
     return functools.partial(function, batch_size=starting_batch_size)
 

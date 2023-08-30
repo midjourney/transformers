@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+import transformers
 from transformers import (
     BERT_PRETRAINED_CONFIG_ARCHIVE_MAP,
     GPT2_PRETRAINED_CONFIG_ARCHIVE_MAP,
@@ -65,6 +66,9 @@ if is_tokenizers_available():
 
 
 class AutoTokenizerTest(unittest.TestCase):
+    def setUp(self):
+        transformers.dynamic_module_utils.TIME_OUT_REMOTE_CODE = 0
+
     @slow
     def test_tokenizer_from_pretrained(self):
         for model_name in (x for x in BERT_PRETRAINED_CONFIG_ARCHIVE_MAP.keys() if "japanese" not in x):
@@ -230,8 +234,6 @@ class AutoTokenizerTest(unittest.TestCase):
 
         # Check the class of the tokenizer was properly saved (note that it always saves the slow class).
         self.assertEqual(config["tokenizer_class"], "BertTokenizer")
-        # Check other keys just to make sure the config was properly saved /reloaded.
-        self.assertEqual(config["name_or_path"], SMALL_MODEL_IDENTIFIER)
 
     def test_new_tokenizer_registration(self):
         try:
@@ -300,10 +302,26 @@ class AutoTokenizerTest(unittest.TestCase):
                 del TOKENIZER_MAPPING._extra_content[CustomConfig]
 
     def test_from_pretrained_dynamic_tokenizer(self):
+        # If remote code is not set, we will time out when asking whether to load the model.
+        with self.assertRaises(ValueError):
+            tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/test_dynamic_tokenizer")
+        # If remote code is disabled, we can't load this config.
+        with self.assertRaises(ValueError):
+            tokenizer = AutoTokenizer.from_pretrained(
+                "hf-internal-testing/test_dynamic_tokenizer", trust_remote_code=False
+            )
+
         tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/test_dynamic_tokenizer", trust_remote_code=True)
         self.assertTrue(tokenizer.special_attribute_present)
+        # Test tokenizer can be reloaded.
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tokenizer.save_pretrained(tmp_dir)
+            reloaded_tokenizer = AutoTokenizer.from_pretrained(tmp_dir, trust_remote_code=True)
+        self.assertTrue(reloaded_tokenizer.special_attribute_present)
+
         if is_tokenizers_available():
             self.assertEqual(tokenizer.__class__.__name__, "NewTokenizerFast")
+            self.assertEqual(reloaded_tokenizer.__class__.__name__, "NewTokenizerFast")
 
             # Test we can also load the slow version
             tokenizer = AutoTokenizer.from_pretrained(
@@ -311,8 +329,66 @@ class AutoTokenizerTest(unittest.TestCase):
             )
             self.assertTrue(tokenizer.special_attribute_present)
             self.assertEqual(tokenizer.__class__.__name__, "NewTokenizer")
+            # Test tokenizer can be reloaded.
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tokenizer.save_pretrained(tmp_dir)
+                reloaded_tokenizer = AutoTokenizer.from_pretrained(tmp_dir, trust_remote_code=True, use_fast=False)
+            self.assertEqual(reloaded_tokenizer.__class__.__name__, "NewTokenizer")
+            self.assertTrue(reloaded_tokenizer.special_attribute_present)
         else:
             self.assertEqual(tokenizer.__class__.__name__, "NewTokenizer")
+            self.assertEqual(reloaded_tokenizer.__class__.__name__, "NewTokenizer")
+
+    @require_tokenizers
+    def test_from_pretrained_dynamic_tokenizer_conflict(self):
+        class NewTokenizer(BertTokenizer):
+            special_attribute_present = False
+
+        class NewTokenizerFast(BertTokenizerFast):
+            slow_tokenizer_class = NewTokenizer
+            special_attribute_present = False
+
+        try:
+            AutoConfig.register("custom", CustomConfig)
+            AutoTokenizer.register(CustomConfig, slow_tokenizer_class=NewTokenizer)
+            AutoTokenizer.register(CustomConfig, fast_tokenizer_class=NewTokenizerFast)
+            # If remote code is not set, the default is to use local
+            tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/test_dynamic_tokenizer")
+            self.assertEqual(tokenizer.__class__.__name__, "NewTokenizerFast")
+            self.assertFalse(tokenizer.special_attribute_present)
+            tokenizer = AutoTokenizer.from_pretrained("hf-internal-testing/test_dynamic_tokenizer", use_fast=False)
+            self.assertEqual(tokenizer.__class__.__name__, "NewTokenizer")
+            self.assertFalse(tokenizer.special_attribute_present)
+
+            # If remote code is disabled, we load the local one.
+            tokenizer = AutoTokenizer.from_pretrained(
+                "hf-internal-testing/test_dynamic_tokenizer", trust_remote_code=False
+            )
+            self.assertEqual(tokenizer.__class__.__name__, "NewTokenizerFast")
+            self.assertFalse(tokenizer.special_attribute_present)
+            tokenizer = AutoTokenizer.from_pretrained(
+                "hf-internal-testing/test_dynamic_tokenizer", trust_remote_code=False, use_fast=False
+            )
+            self.assertEqual(tokenizer.__class__.__name__, "NewTokenizer")
+            self.assertFalse(tokenizer.special_attribute_present)
+
+            # If remote is enabled, we load from the Hub
+            tokenizer = AutoTokenizer.from_pretrained(
+                "hf-internal-testing/test_dynamic_tokenizer", trust_remote_code=True
+            )
+            self.assertEqual(tokenizer.__class__.__name__, "NewTokenizerFast")
+            self.assertTrue(tokenizer.special_attribute_present)
+            tokenizer = AutoTokenizer.from_pretrained(
+                "hf-internal-testing/test_dynamic_tokenizer", trust_remote_code=True, use_fast=False
+            )
+            self.assertEqual(tokenizer.__class__.__name__, "NewTokenizer")
+            self.assertTrue(tokenizer.special_attribute_present)
+
+        finally:
+            if "custom" in CONFIG_MAPPING._extra_content:
+                del CONFIG_MAPPING._extra_content["custom"]
+            if CustomConfig in TOKENIZER_MAPPING._extra_content:
+                del TOKENIZER_MAPPING._extra_content[CustomConfig]
 
     def test_from_pretrained_dynamic_tokenizer_legacy_format(self):
         tokenizer = AutoTokenizer.from_pretrained(

@@ -147,7 +147,7 @@ class AlbertTokenizer(PreTrainedTokenizer):
         cls_token="[CLS]",
         mask_token="[MASK]",
         sp_model_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs
+        **kwargs,
     ) -> None:
         # Mask token behave like a normal word, i.e. include the space before it and
         # is included in the raw text, there should be a match in a non-normalized sentence.
@@ -183,10 +183,10 @@ class AlbertTokenizer(PreTrainedTokenizer):
         self.sp_model.Load(vocab_file)
 
     @property
-    def vocab_size(self):
+    def vocab_size(self) -> int:
         return len(self.sp_model)
 
-    def get_vocab(self):
+    def get_vocab(self) -> Dict[str, int]:
         vocab = {self.convert_ids_to_tokens(i): i for i in range(self.vocab_size)}
         vocab.update(self.added_tokens_encoder)
         return vocab
@@ -250,7 +250,23 @@ class AlbertTokenizer(PreTrainedTokenizer):
         return self.sp_model.IdToPiece(index)
 
     def convert_tokens_to_string(self, tokens):
-        return self.sp_model.decode(tokens)
+        """Converts a sequence of tokens (string) in a single string."""
+        current_sub_tokens = []
+        out_string = ""
+        prev_is_special = False
+        for token in tokens:
+            # make sure that special tokens are not decoded using sentencepiece model
+            if token in self.all_special_tokens:
+                if not prev_is_special:
+                    out_string += " "
+                out_string += self.sp_model.decode(current_sub_tokens) + token
+                prev_is_special = True
+                current_sub_tokens = []
+            else:
+                current_sub_tokens.append(token)
+                prev_is_special = False
+        out_string += self.sp_model.decode(current_sub_tokens)
+        return out_string.strip()
 
     def build_inputs_with_special_tokens(
         self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None

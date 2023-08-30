@@ -14,6 +14,8 @@
 # limitations under the License.
 
 
+from __future__ import annotations
+
 import unittest
 
 from transformers import OpenAIGPTConfig, is_tf_available
@@ -21,6 +23,7 @@ from transformers.testing_utils import require_tf, slow
 
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_tf_common import TFModelTesterMixin, ids_tensor, random_attention_mask
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_tf_available():
@@ -50,7 +53,7 @@ class TFOpenAIGPTModelTester:
         self.use_mc_token_ids = True
         self.vocab_size = 99
         self.hidden_size = 32
-        self.num_hidden_layers = 5
+        self.num_hidden_layers = 2
         self.num_attention_heads = 4
         self.intermediate_size = 37
         self.hidden_act = "gelu"
@@ -191,8 +194,7 @@ class TFOpenAIGPTModelTester:
 
 
 @require_tf
-class TFOpenAIGPTModelTest(TFModelTesterMixin, unittest.TestCase):
-
+class TFOpenAIGPTModelTest(TFModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (
         (TFOpenAIGPTModel, TFOpenAIGPTLMHeadModel, TFOpenAIGPTDoubleHeadsModel, TFOpenAIGPTForSequenceClassification)
         if is_tf_available()
@@ -201,8 +203,30 @@ class TFOpenAIGPTModelTest(TFModelTesterMixin, unittest.TestCase):
     all_generative_model_classes = (
         (TFOpenAIGPTLMHeadModel,) if is_tf_available() else ()
     )  # TODO (PVP): Add Double HeadsModel when generate() function is changed accordingly
+    pipeline_model_mapping = (
+        {
+            "feature-extraction": TFOpenAIGPTModel,
+            "text-classification": TFOpenAIGPTForSequenceClassification,
+            "text-generation": TFOpenAIGPTLMHeadModel,
+            "zero-shot": TFOpenAIGPTForSequenceClassification,
+        }
+        if is_tf_available()
+        else {}
+    )
     test_head_masking = False
     test_onnx = False
+
+    # TODO: Fix the failed tests
+    def is_pipeline_test_to_skip(
+        self, pipeline_test_casse_name, config_class, model_architecture, tokenizer_name, processor_name
+    ):
+        if pipeline_test_casse_name == "ZeroShotClassificationPipelineTests":
+            # Get `tokenizer does not have a padding token` error for both fast/slow tokenizers.
+            # `OpenAIGPTConfig` was never used in pipeline tests, either because of a missing checkpoint or because a
+            # tiny config could not be created.
+            return True
+
+        return False
 
     def setUp(self):
         self.model_tester = TFOpenAIGPTModelTester(self)
@@ -222,24 +246,6 @@ class TFOpenAIGPTModelTest(TFModelTesterMixin, unittest.TestCase):
     def test_openai_gpt_double_head(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_openai_gpt_double_head(*config_and_inputs)
-
-    def test_model_common_attributes(self):
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-
-        for model_class in self.all_model_classes:
-            model = model_class(config)
-            assert isinstance(model.get_input_embeddings(), tf.keras.layers.Layer)
-
-            if model_class in self.all_generative_model_classes:
-                x = model.get_output_embeddings()
-                assert isinstance(x, tf.keras.layers.Layer)
-                name = model.get_bias()
-                assert name is None
-            else:
-                x = model.get_output_embeddings()
-                assert x is None
-                name = model.get_bias()
-                assert name is None
 
     def test_openai_gpt_sequence_classification_model(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()

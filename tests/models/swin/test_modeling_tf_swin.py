@@ -15,17 +15,20 @@
 """ Testing suite for the TF 2.0 Swin model. """
 
 
+from __future__ import annotations
+
 import inspect
 import unittest
 
 import numpy as np
 
 from transformers import SwinConfig
-from transformers.testing_utils import require_tf, require_vision, slow, to_2tuple, tooslow
+from transformers.testing_utils import require_tf, require_vision, slow, to_2tuple
 from transformers.utils import cached_property, is_tf_available, is_vision_available
 
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_tf_common import TFModelTesterMixin, floats_tensor, ids_tensor
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_tf_available():
@@ -42,7 +45,7 @@ if is_tf_available():
 if is_vision_available():
     from PIL import Image
 
-    from transformers import AutoFeatureExtractor
+    from transformers import AutoImageProcessor
 
 
 class TFSwinModelTester:
@@ -176,8 +179,7 @@ class TFSwinModelTester:
 
 
 @require_tf
-class TFSwinModelTest(TFModelTesterMixin, unittest.TestCase):
-
+class TFSwinModelTest(TFModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (
         (
             TFSwinModel,
@@ -186,6 +188,11 @@ class TFSwinModelTest(TFModelTesterMixin, unittest.TestCase):
         )
         if is_tf_available()
         else ()
+    )
+    pipeline_model_mapping = (
+        {"feature-extraction": TFSwinModel, "image-classification": TFSwinForImageClassification}
+        if is_tf_available()
+        else {}
     )
 
     test_pruning = False
@@ -223,10 +230,6 @@ class TFSwinModelTest(TFModelTesterMixin, unittest.TestCase):
 
     @unittest.skip(reason="Swin does not use inputs_embeds")
     def test_inputs_embeds(self):
-        pass
-
-    @tooslow
-    def test_saved_model_creation(self):
         pass
 
     def test_model_common_attributes(self):
@@ -335,7 +338,6 @@ class TFSwinModelTest(TFModelTesterMixin, unittest.TestCase):
         )
 
     def test_hidden_states_output(self):
-
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
 
         image_size = to_2tuple(self.model_tester.image_size)
@@ -380,9 +382,9 @@ class TFSwinModelTest(TFModelTesterMixin, unittest.TestCase):
 @require_tf
 class TFSwinModelIntegrationTest(unittest.TestCase):
     @cached_property
-    def default_feature_extractor(self):
+    def default_image_processor(self):
         return (
-            AutoFeatureExtractor.from_pretrained("microsoft/swin-tiny-patch4-window7-224")
+            AutoImageProcessor.from_pretrained("microsoft/swin-tiny-patch4-window7-224")
             if is_vision_available()
             else None
         )
@@ -390,10 +392,10 @@ class TFSwinModelIntegrationTest(unittest.TestCase):
     @slow
     def test_inference_image_classification_head(self):
         model = TFSwinForImageClassification.from_pretrained("microsoft/swin-tiny-patch4-window7-224")
-        feature_extractor = self.default_feature_extractor
+        image_processor = self.default_image_processor
 
         image = Image.open("./tests/fixtures/tests_samples/COCO/000000039769.png")
-        inputs = feature_extractor(images=image, return_tensors="tf")
+        inputs = image_processor(images=image, return_tensors="tf")
 
         # forward pass
         outputs = model(inputs)

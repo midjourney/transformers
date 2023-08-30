@@ -21,6 +21,12 @@ from typing import Callable, List, Optional, Union
 import tensorflow as tf
 
 
+try:
+    from tensorflow.keras.optimizers.legacy import Adam
+except ImportError:
+    from tensorflow.keras.optimizers import Adam
+
+
 class WarmUp(tf.keras.optimizers.schedules.LearningRateSchedule):
     """
     Applies a warmup schedule on a given learning rate decay schedule.
@@ -111,9 +117,9 @@ def create_optimizer(
             The beta2 to use in Adam.
         adam_epsilon (`float`, *optional*, defaults to 1e-8):
             The epsilon to use in Adam.
-        adam_clipnorm: (`float`, *optional*, defaults to `None`):
+        adam_clipnorm (`float`, *optional*, defaults to `None`):
             If not `None`, clip the gradient norm for each weight tensor to this value.
-        adam_global_clipnorm: (`float`, *optional*, defaults to `None`)
+        adam_global_clipnorm (`float`, *optional*, defaults to `None`)
             If not `None`, clip gradient norm to this value. When using this argument, the norm is computed over all
             weight tensors, as if they were concatenated into a single vector.
         weight_decay_rate (`float`, *optional*, defaults to 0):
@@ -163,14 +169,14 @@ def create_optimizer(
     return optimizer, lr_schedule
 
 
-class AdamWeightDecay(tf.keras.optimizers.Adam):
+class AdamWeightDecay(Adam):
     """
     Adam enables L2 weight decay and clip_by_global_norm on gradients. Just adding the square of the weights to the
     loss function is *not* the correct way of using L2 regularization/weight decay with Adam, since that will interact
     with the m and v parameters in strange ways as shown in [Decoupled Weight Decay
     Regularization](https://arxiv.org/abs/1711.05101).
 
-    Instead we want ot decay the weights in a manner that doesn't interact with the m/v parameters. This is equivalent
+    Instead we want to decay the weights in a manner that doesn't interact with the m/v parameters. This is equivalent
     to adding the square of the weights to the loss with plain (non-momentum) SGD.
 
     Args:
@@ -195,7 +201,7 @@ class AdamWeightDecay(tf.keras.optimizers.Adam):
             `include_in_weight_decay` is passed, the names in it will supersede this list.
         name (`str`, *optional*, defaults to 'AdamWeightDecay'):
             Optional name for the operations created when applying gradients.
-        kwargs:
+        kwargs (`Dict[str, Any]`, *optional*):
             Keyword arguments. Allowed to be {`clipnorm`, `clipvalue`, `lr`, `decay`}. `clipnorm` is clip gradients by
             norm; `clipvalue` is clip gradients by value, `decay` is included for backward compatibility to allow time
             inverse decay of learning rate. `lr` is included for backward compatibility, recommended to use
@@ -213,7 +219,7 @@ class AdamWeightDecay(tf.keras.optimizers.Adam):
         include_in_weight_decay: Optional[List[str]] = None,
         exclude_from_weight_decay: Optional[List[str]] = None,
         name: str = "AdamWeightDecay",
-        **kwargs
+        **kwargs,
     ):
         super().__init__(learning_rate, beta_1, beta_2, epsilon, amsgrad, name, **kwargs)
         self.weight_decay_rate = weight_decay_rate
@@ -256,7 +262,7 @@ class AdamWeightDecay(tf.keras.optimizers.Adam):
             coefficients = self._fallback_apply_state(var_device, var_dtype)
             apply_state[(var_device, var_dtype)] = coefficients
 
-        return coefficients["lr_t"], dict(apply_state=apply_state)
+        return coefficients["lr_t"], {"apply_state": apply_state}
 
     def _resource_apply_dense(self, grad, var, apply_state=None):
         lr_t, kwargs = self._get_lr(var.device, var.dtype.base_dtype, apply_state)
@@ -327,7 +333,7 @@ class GradientAccumulator(object):
         """The accumulated gradients on the current replica."""
         if not self._gradients:
             raise ValueError("The accumulator should be called first to initialize the gradients")
-        return list(gradient.value() if gradient is not None else gradient for gradient in self._gradients)
+        return [gradient.value() if gradient is not None else gradient for gradient in self._gradients]
 
     def __call__(self, gradients):
         """Accumulates `gradients` on the current replica."""

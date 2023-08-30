@@ -15,10 +15,8 @@
 """Tokenization classes for Bloom."""
 
 
-import json
+import pickle
 from typing import TYPE_CHECKING, List, Optional, Tuple
-
-from tokenizers import pre_tokenizers
 
 from ...tokenization_utils_base import BatchEncoding
 from ...tokenization_utils_fast import PreTrainedTokenizerFast
@@ -54,13 +52,15 @@ class BloomTokenizerFast(PreTrainedTokenizerFast):
     This tokenizer has been trained to treat spaces like parts of the tokens (a bit like sentencepiece) so a word will
     be encoded differently whether it is at the beginning of the sentence (without space) or not:
 
-    ```
+    ```python
     >>> from transformers import BloomTokenizerFast
+
     >>> tokenizer = BloomTokenizerFast.from_pretrained("bigscience/bloom")
-    >>> tokenizer("Hello world")['input_ids']
-    [15496, 995]
-    >>> tokenizer(" Hello world")['input_ids']
-    [18435, 995]
+    >>> tokenizer("Hello world")["input_ids"]
+    [59414, 8876]
+
+    >>> tokenizer(" Hello world")["input_ids"]
+    [86153, 8876]
     ```
 
     You can get around that behavior by passing `add_prefix_space=True` when instantiating this tokenizer, but since
@@ -113,7 +113,8 @@ class BloomTokenizerFast(PreTrainedTokenizerFast):
         eos_token="</s>",
         pad_token="<pad>",
         add_prefix_space=False,
-        **kwargs
+        clean_up_tokenization_spaces=False,
+        **kwargs,
     ):
         super().__init__(
             vocab_file,
@@ -124,13 +125,19 @@ class BloomTokenizerFast(PreTrainedTokenizerFast):
             eos_token=eos_token,
             pad_token=pad_token,
             add_prefix_space=add_prefix_space,
+            clean_up_tokenization_spaces=clean_up_tokenization_spaces,
             **kwargs,
         )
-        pre_tok_state = json.loads(self.backend_tokenizer.pre_tokenizer.__getstate__())
-        if pre_tok_state.get("add_prefix_space", add_prefix_space) != add_prefix_space:
-            pre_tok_class = getattr(pre_tokenizers, pre_tok_state.pop("type"))
-            pre_tok_state["add_prefix_space"] = add_prefix_space
-            self.backend_tokenizer.pre_tokenizer = pre_tok_class(**pre_tok_state)
+        # TODO @ArthurZucker this can only work one way for now, to update later-on. Tests should also properly
+        # check this as they were green before.
+        pre_tok_state = pickle.dumps(self.backend_tokenizer.pre_tokenizer)
+        decoder_state = pickle.dumps(self.backend_tokenizer.decoder)
+
+        if add_prefix_space:
+            pre_tok_state = pre_tok_state.replace(b'"add_prefix_space":false', b'"add_prefix_space": true')
+            decoder_state = decoder_state.replace(b'"add_prefix_space":false', b'"add_prefix_space": true')
+        self.backend_tokenizer.pre_tokenizer = pickle.loads(pre_tok_state)
+        self.backend_tokenizer.decoder = pickle.loads(decoder_state)
 
         self.add_prefix_space = add_prefix_space
 

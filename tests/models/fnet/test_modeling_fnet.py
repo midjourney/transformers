@@ -24,6 +24,7 @@ from transformers.testing_utils import require_tokenizers, require_torch, slow, 
 
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import ModelTesterMixin, floats_tensor, ids_tensor
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
@@ -69,7 +70,7 @@ class FNetModelTester:
         use_labels=True,
         vocab_size=99,
         hidden_size=32,
-        num_hidden_layers=5,
+        num_hidden_layers=2,
         intermediate_size=37,
         hidden_act="gelu",
         hidden_dropout_prob=0.1,
@@ -265,8 +266,7 @@ class FNetModelTester:
 
 
 @require_torch
-class FNetModelTest(ModelTesterMixin, unittest.TestCase):
-
+class FNetModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (
         (
             FNetModel,
@@ -281,11 +281,32 @@ class FNetModelTest(ModelTesterMixin, unittest.TestCase):
         if is_torch_available()
         else ()
     )
+    pipeline_model_mapping = (
+        {
+            "feature-extraction": FNetModel,
+            "fill-mask": FNetForMaskedLM,
+            "question-answering": FNetForQuestionAnswering,
+            "text-classification": FNetForSequenceClassification,
+            "token-classification": FNetForTokenClassification,
+            "zero-shot": FNetForSequenceClassification,
+        }
+        if is_torch_available()
+        else {}
+    )
 
     # Skip Tests
     test_pruning = False
     test_head_masking = False
     test_pruning = False
+
+    # TODO: Fix the failed tests
+    def is_pipeline_test_to_skip(
+        self, pipeline_test_casse_name, config_class, model_architecture, tokenizer_name, processor_name
+    ):
+        if pipeline_test_casse_name == "QAPipelineTests" and not tokenizer_name.endswith("Fast"):
+            return True
+
+        return False
 
     # special case for ForPreTraining model
     def _prepare_for_class(self, inputs_dict, model_class, return_labels=False):
@@ -493,7 +514,8 @@ class FNetModelIntegrationTest(unittest.TestCase):
         model.to(torch_device)
 
         input_ids = torch.tensor([[0, 1, 2, 3, 4, 5]], device=torch_device)
-        output = model(input_ids)[0]
+        with torch.no_grad():
+            output = model(input_ids)[0]
 
         vocab_size = 32000
 
@@ -536,7 +558,8 @@ class FNetModelIntegrationTest(unittest.TestCase):
         model.to(torch_device)
 
         input_ids = torch.tensor([[0, 1, 2, 3, 4, 5]], device=torch_device)
-        output = model(input_ids)[0]
+        with torch.no_grad():
+            output = model(input_ids)[0]
 
         expected_shape = torch.Size((1, 2))
         self.assertEqual(output.shape, expected_shape)
@@ -551,7 +574,8 @@ class FNetModelIntegrationTest(unittest.TestCase):
         model.to(torch_device)
 
         input_ids = torch.tensor([[0, 1, 2, 3, 4, 5]], device=torch_device)
-        output = model(input_ids)[0]
+        with torch.no_grad():
+            output = model(input_ids)[0]
 
         expected_shape = torch.Size((1, 6, model.config.hidden_size))
         self.assertEqual(output.shape, expected_shape)

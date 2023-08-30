@@ -22,21 +22,24 @@ from transformers import SwinConfig
 from transformers.testing_utils import require_torch, require_vision, slow, torch_device
 from transformers.utils import cached_property, is_torch_available, is_vision_available
 
+from ...test_backbone_common import BackboneTesterMixin
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import ModelTesterMixin, _config_zero_init, floats_tensor, ids_tensor
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
     import torch
     from torch import nn
 
-    from transformers import SwinForImageClassification, SwinForMaskedImageModeling, SwinModel
+    from transformers import SwinBackbone, SwinForImageClassification, SwinForMaskedImageModeling, SwinModel
     from transformers.models.swin.modeling_swin import SWIN_PRETRAINED_MODEL_ARCHIVE_LIST
+
 
 if is_vision_available():
     from PIL import Image
 
-    from transformers import AutoFeatureExtractor
+    from transformers import AutoImageProcessor
 
 
 class SwinModelTester:
@@ -66,6 +69,8 @@ class SwinModelTester:
         use_labels=True,
         type_sequence_label_size=10,
         encoder_stride=8,
+        out_features=["stage1", "stage2"],
+        out_indices=[1, 2],
     ):
         self.parent = parent
         self.batch_size = batch_size
@@ -91,6 +96,8 @@ class SwinModelTester:
         self.use_labels = use_labels
         self.type_sequence_label_size = type_sequence_label_size
         self.encoder_stride = encoder_stride
+        self.out_features = out_features
+        self.out_indices = out_indices
 
     def prepare_config_and_inputs(self):
         pixel_values = floats_tensor([self.batch_size, self.num_channels, self.image_size, self.image_size])
@@ -123,6 +130,8 @@ class SwinModelTester:
             layer_norm_eps=self.layer_norm_eps,
             initializer_range=self.initializer_range,
             encoder_stride=self.encoder_stride,
+            out_features=self.out_features,
+            out_indices=self.out_indices,
         )
 
     def create_and_check_model(self, config, pixel_values, labels):
@@ -135,6 +144,33 @@ class SwinModelTester:
         expected_dim = int(config.embed_dim * 2 ** (len(config.depths) - 1))
 
         self.parent.assertEqual(result.last_hidden_state.shape, (self.batch_size, expected_seq_len, expected_dim))
+
+    def create_and_check_backbone(self, config, pixel_values, labels):
+        model = SwinBackbone(config=config)
+        model.to(torch_device)
+        model.eval()
+        result = model(pixel_values)
+
+        # verify hidden states
+        self.parent.assertEqual(len(result.feature_maps), len(config.out_features))
+        self.parent.assertListEqual(list(result.feature_maps[0].shape), [self.batch_size, model.channels[0], 16, 16])
+
+        # verify channels
+        self.parent.assertEqual(len(model.channels), len(config.out_features))
+
+        # verify backbone works with out_features=None
+        config.out_features = None
+        model = SwinBackbone(config=config)
+        model.to(torch_device)
+        model.eval()
+        result = model(pixel_values)
+
+        # verify feature maps
+        self.parent.assertEqual(len(result.feature_maps), 1)
+        self.parent.assertListEqual(list(result.feature_maps[0].shape), [self.batch_size, model.channels[-1], 4, 4])
+
+        # verify channels
+        self.parent.assertEqual(len(model.channels), 1)
 
     def create_and_check_for_masked_image_modeling(self, config, pixel_values, labels):
         model = SwinForMaskedImageModeling(config=config)
@@ -185,16 +221,21 @@ class SwinModelTester:
 
 
 @require_torch
-class SwinModelTest(ModelTesterMixin, unittest.TestCase):
-
+class SwinModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (
         (
             SwinModel,
+            SwinBackbone,
             SwinForImageClassification,
             SwinForMaskedImageModeling,
         )
         if is_torch_available()
         else ()
+    )
+    pipeline_model_mapping = (
+        {"feature-extraction": SwinModel, "image-classification": SwinForImageClassification}
+        if is_torch_available()
+        else {}
     )
     fx_compatible = True
 
@@ -222,6 +263,18 @@ class SwinModelTest(ModelTesterMixin, unittest.TestCase):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_model(*config_and_inputs)
 
+    # TODO: check if this works again for PyTorch 2.x.y
+    @unittest.skip(reason="Got `CUDA error: misaligned address` with PyTorch 2.0.0.")
+    def test_multi_gpu_data_parallel_forward(self):
+        pass
+
+    def test_training_gradient_checkpointing(self):
+        super().test_training_gradient_checkpointing()
+
+    def test_backbone(self):
+        config_and_inputs = self.model_tester.prepare_config_and_inputs()
+        self.model_tester.create_and_check_backbone(*config_and_inputs)
+
     def test_for_masked_image_modeling(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_for_masked_image_modeling(*config_and_inputs)
@@ -230,8 +283,12 @@ class SwinModelTest(ModelTesterMixin, unittest.TestCase):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_for_image_classification(*config_and_inputs)
 
+    @unittest.skip(reason="Swin does not use inputs_embeds")
     def test_inputs_embeds(self):
-        # Swin does not use inputs_embeds
+        pass
+
+    @unittest.skip(reason="Swin Transformer does not use feedforward chunking")
+    def test_feed_forward_chunking(self):
         pass
 
     def test_model_common_attributes(self):
@@ -299,11 +356,8 @@ class SwinModelTest(ModelTesterMixin, unittest.TestCase):
             with torch.no_grad():
                 outputs = model(**self._prepare_for_class(inputs_dict, model_class))
 
-            if hasattr(self.model_tester, "num_hidden_states_types"):
-                added_hidden_states = self.model_tester.num_hidden_states_types
-            else:
-                # also another +1 for reshaped_hidden_states
-                added_hidden_states = 2
+            # also another +1 for reshaped_hidden_states
+            added_hidden_states = 1 if model_class.__name__ == "SwinBackbone" else 2
             self.assertEqual(out_len + added_hidden_states, len(outputs))
 
             self_attentions = outputs.attentions
@@ -344,17 +398,18 @@ class SwinModelTest(ModelTesterMixin, unittest.TestCase):
             [num_patches, self.model_tester.embed_dim],
         )
 
-        reshaped_hidden_states = outputs.reshaped_hidden_states
-        self.assertEqual(len(reshaped_hidden_states), expected_num_layers)
+        if not model_class.__name__ == "SwinBackbone":
+            reshaped_hidden_states = outputs.reshaped_hidden_states
+            self.assertEqual(len(reshaped_hidden_states), expected_num_layers)
 
-        batch_size, num_channels, height, width = reshaped_hidden_states[0].shape
-        reshaped_hidden_states = (
-            reshaped_hidden_states[0].view(batch_size, num_channels, height * width).permute(0, 2, 1)
-        )
-        self.assertListEqual(
-            list(reshaped_hidden_states.shape[-2:]),
-            [num_patches, self.model_tester.embed_dim],
-        )
+            batch_size, num_channels, height, width = reshaped_hidden_states[0].shape
+            reshaped_hidden_states = (
+                reshaped_hidden_states[0].view(batch_size, num_channels, height * width).permute(0, 2, 1)
+            )
+            self.assertListEqual(
+                list(reshaped_hidden_states.shape[-2:]),
+                [num_patches, self.model_tester.embed_dim],
+            )
 
     def test_hidden_states_output(self):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
@@ -427,9 +482,9 @@ class SwinModelTest(ModelTesterMixin, unittest.TestCase):
 @require_torch
 class SwinModelIntegrationTest(unittest.TestCase):
     @cached_property
-    def default_feature_extractor(self):
+    def default_image_processor(self):
         return (
-            AutoFeatureExtractor.from_pretrained("microsoft/swin-tiny-patch4-window7-224")
+            AutoImageProcessor.from_pretrained("microsoft/swin-tiny-patch4-window7-224")
             if is_vision_available()
             else None
         )
@@ -437,10 +492,10 @@ class SwinModelIntegrationTest(unittest.TestCase):
     @slow
     def test_inference_image_classification_head(self):
         model = SwinForImageClassification.from_pretrained("microsoft/swin-tiny-patch4-window7-224").to(torch_device)
-        feature_extractor = self.default_feature_extractor
+        image_processor = self.default_image_processor
 
         image = Image.open("./tests/fixtures/tests_samples/COCO/000000039769.png")
-        inputs = feature_extractor(images=image, return_tensors="pt").to(torch_device)
+        inputs = image_processor(images=image, return_tensors="pt").to(torch_device)
 
         # forward pass
         with torch.no_grad():
@@ -451,3 +506,12 @@ class SwinModelIntegrationTest(unittest.TestCase):
         self.assertEqual(outputs.logits.shape, expected_shape)
         expected_slice = torch.tensor([-0.0948, -0.6454, -0.0921]).to(torch_device)
         self.assertTrue(torch.allclose(outputs.logits[0, :3], expected_slice, atol=1e-4))
+
+
+@require_torch
+class SwinBackboneTest(unittest.TestCase, BackboneTesterMixin):
+    all_model_classes = (SwinBackbone,) if is_torch_available() else ()
+    config_class = SwinConfig
+
+    def setUp(self):
+        self.model_tester = SwinModelTester(self)

@@ -19,11 +19,11 @@ if is_vision_available():
 if is_tf_available():
     import tensorflow as tf
 
-    from ..models.auto.modeling_tf_auto import TF_MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING
+    from ..models.auto.modeling_tf_auto import TF_MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING_NAMES
     from ..tf_utils import stable_softmax
 
 if is_torch_available():
-    from ..models.auto.modeling_auto import MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING
+    from ..models.auto.modeling_auto import MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING_NAMES
 
 logger = logging.get_logger(__name__)
 
@@ -33,6 +33,18 @@ class ImageClassificationPipeline(Pipeline):
     """
     Image classification pipeline using any `AutoModelForImageClassification`. This pipeline predicts the class of an
     image.
+
+    Example:
+
+    ```python
+    >>> from transformers import pipeline
+
+    >>> classifier = pipeline(model="microsoft/beit-base-patch16-224-pt22k-ft22k")
+    >>> classifier("https://huggingface.co/datasets/Narsil/image_dummy/raw/main/parrots.png")
+    [{'score': 0.442, 'label': 'macaw'}, {'score': 0.088, 'label': 'popinjay'}, {'score': 0.075, 'label': 'parrot'}, {'score': 0.073, 'label': 'parodist, lampooner'}, {'score': 0.046, 'label': 'poll, poll_parrot'}]
+    ```
+
+    Learn more about the basics of using a pipeline in the [pipeline tutorial](../pipeline_tutorial)
 
     This image classification pipeline can currently be loaded from [`pipeline`] using the following task identifier:
     `"image-classification"`.
@@ -45,16 +57,19 @@ class ImageClassificationPipeline(Pipeline):
         super().__init__(*args, **kwargs)
         requires_backends(self, "vision")
         self.check_model_type(
-            TF_MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING
+            TF_MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING_NAMES
             if self.framework == "tf"
-            else MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING
+            else MODEL_FOR_IMAGE_CLASSIFICATION_MAPPING_NAMES
         )
 
-    def _sanitize_parameters(self, top_k=None):
+    def _sanitize_parameters(self, top_k=None, timeout=None):
+        preprocess_params = {}
+        if timeout is not None:
+            preprocess_params["timeout"] = timeout
         postprocess_params = {}
         if top_k is not None:
             postprocess_params["top_k"] = top_k
-        return {}, {}, postprocess_params
+        return preprocess_params, {}, postprocess_params
 
     def __call__(self, images: Union[str, List[str], "Image.Image", List["Image.Image"]], **kwargs):
         """
@@ -74,6 +89,9 @@ class ImageClassificationPipeline(Pipeline):
             top_k (`int`, *optional*, defaults to 5):
                 The number of top labels that will be returned by the pipeline. If the provided number is higher than
                 the number of labels available in the model configuration, it will default to the number of labels.
+            timeout (`float`, *optional*, defaults to None):
+                The maximum time in seconds to wait for fetching images from the web. If None, no timeout is set and
+                the call may block forever.
 
         Return:
             A dictionary or a list of dictionaries containing result. If the input is a single image, will return a
@@ -87,9 +105,9 @@ class ImageClassificationPipeline(Pipeline):
         """
         return super().__call__(images, **kwargs)
 
-    def preprocess(self, image):
-        image = load_image(image)
-        model_inputs = self.feature_extractor(images=image, return_tensors=self.framework)
+    def preprocess(self, image, timeout=None):
+        image = load_image(image, timeout=timeout)
+        model_inputs = self.image_processor(images=image, return_tensors=self.framework)
         return model_inputs
 
     def _forward(self, model_inputs):

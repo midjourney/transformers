@@ -16,6 +16,8 @@
 # Original license: https://github.com/apple/ml-cvnets/blob/main/LICENSE
 """ TensorFlow 2.0 MobileViT model."""
 
+from __future__ import annotations
+
 from typing import Dict, Optional, Tuple, Union
 
 import tensorflow as tf
@@ -43,7 +45,6 @@ logger = logging.get_logger(__name__)
 
 # General docstring
 _CONFIG_FOR_DOC = "MobileViTConfig"
-_FEAT_EXTRACTOR_FOR_DOC = "MobileViTFeatureExtractor"
 
 # Base docstring
 _CHECKPOINT_FOR_DOC = "apple/mobilevit-small"
@@ -92,12 +93,12 @@ class TFMobileViTConvLayer(tf.keras.layers.Layer):
         dilation: int = 1,
         use_normalization: bool = True,
         use_activation: Union[bool, str] = True,
-        **kwargs
+        **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         logger.warning(
             f"\n{self.__class__.__name__} has backpropagation operations that are NOT supported on CPU. If you wish "
-            "to train/fine-tine this model, you need a GPU or a TPU"
+            "to train/fine-tune this model, you need a GPU or a TPU"
         )
 
         padding = int((kernel_size - 1) / 2) * dilation
@@ -198,7 +199,7 @@ class TFMobileViTMobileNetLayer(tf.keras.layers.Layer):
         out_channels: int,
         stride: int = 1,
         num_stages: int = 1,
-        **kwargs
+        **kwargs,
     ) -> None:
         super().__init__(**kwargs)
 
@@ -384,7 +385,7 @@ class TFMobileViTLayer(tf.keras.layers.Layer):
         hidden_size: int,
         num_stages: int,
         dilation: int = 1,
-        **kwargs
+        **kwargs,
     ) -> None:
         super().__init__(**kwargs)
         self.patch_width = config.patch_size
@@ -664,7 +665,7 @@ class TFMobileViTMainLayer(tf.keras.layers.Layer):
     @unpack_inputs
     def call(
         self,
-        pixel_values: Optional[tf.Tensor] = None,
+        pixel_values: tf.Tensor | None = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         training: bool = False,
@@ -734,38 +735,6 @@ class TFMobileViTPreTrainedModel(TFPreTrainedModel):
     base_model_prefix = "mobilevit"
     main_input_name = "pixel_values"
 
-    @property
-    def dummy_inputs(self) -> Dict[str, tf.Tensor]:
-        """
-        Dummy inputs to build the network.
-
-        Returns:
-            `Dict[str, tf.Tensor]`: The dummy inputs.
-        """
-        VISION_DUMMY_INPUTS = tf.random.uniform(
-            shape=(3, self.config.num_channels, self.config.image_size, self.config.image_size),
-            dtype=tf.float32,
-        )
-        return {"pixel_values": tf.constant(VISION_DUMMY_INPUTS)}
-
-    @tf.function(
-        input_signature=[
-            {
-                "pixel_values": tf.TensorSpec((None, None, None, None), tf.float32, name="pixel_values"),
-            }
-        ]
-    )
-    def serving(self, inputs):
-        """
-        Method used for serving the model.
-
-        Args:
-            inputs (`Dict[str, tf.Tensor]`):
-                The input of the saved model as a dictionary of tensors.
-        """
-        output = self.call(inputs)
-        return self.serving_output(output)
-
 
 MOBILEVIT_START_DOCSTRING = r"""
     This model inherits from [`TFPreTrainedModel`]. Check the superclass documentation for the generic methods the
@@ -811,8 +780,8 @@ MOBILEVIT_START_DOCSTRING = r"""
 MOBILEVIT_INPUTS_DOCSTRING = r"""
     Args:
         pixel_values (`np.ndarray`, `tf.Tensor`, `List[tf.Tensor]`, `Dict[str, tf.Tensor]` or `Dict[str, np.ndarray]` and each example must have the shape `(batch_size, num_channels, height, width)`):
-            Pixel values. Pixel values can be obtained using [`MobileViTFeatureExtractor`]. See
-            [`MobileViTFeatureExtractor.__call__`] for details.
+            Pixel values. Pixel values can be obtained using [`AutoImageProcessor`]. See
+            [`MobileViTImageProcessor.__call__`] for details.
 
         output_hidden_states (`bool`, *optional*):
             Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
@@ -839,7 +808,6 @@ class TFMobileViTModel(TFMobileViTPreTrainedModel):
     @unpack_inputs
     @add_start_docstrings_to_model_forward(MOBILEVIT_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
-        processor_class=_FEAT_EXTRACTOR_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFBaseModelOutputWithPooling,
         config_class=_CONFIG_FOR_DOC,
@@ -848,22 +816,13 @@ class TFMobileViTModel(TFMobileViTPreTrainedModel):
     )
     def call(
         self,
-        pixel_values: Optional[tf.Tensor] = None,
+        pixel_values: tf.Tensor | None = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         training: bool = False,
     ) -> Union[Tuple[tf.Tensor], TFBaseModelOutputWithPooling]:
-
         output = self.mobilevit(pixel_values, output_hidden_states, return_dict, training=training)
         return output
-
-    def serving_output(self, output: TFBaseModelOutputWithPooling) -> TFBaseModelOutputWithPooling:
-        # hidden_states not converted to Tensor with tf.convert_to_tensor as they are all of different dimensions
-        return TFBaseModelOutputWithPooling(
-            last_hidden_state=output.last_hidden_state,
-            pooler_output=output.pooler_output,
-            hidden_states=output.hidden_states,
-        )
 
 
 @add_start_docstrings(
@@ -889,7 +848,6 @@ class TFMobileViTForImageClassification(TFMobileViTPreTrainedModel, TFSequenceCl
     @unpack_inputs
     @add_start_docstrings_to_model_forward(MOBILEVIT_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
-        processor_class=_FEAT_EXTRACTOR_FOR_DOC,
         checkpoint=_IMAGE_CLASS_CHECKPOINT,
         output_type=TFImageClassifierOutputWithNoAttention,
         config_class=_CONFIG_FOR_DOC,
@@ -897,9 +855,9 @@ class TFMobileViTForImageClassification(TFMobileViTPreTrainedModel, TFSequenceCl
     )
     def call(
         self,
-        pixel_values: Optional[tf.Tensor] = None,
+        pixel_values: tf.Tensor | None = None,
         output_hidden_states: Optional[bool] = None,
-        labels: Optional[tf.Tensor] = None,
+        labels: tf.Tensor | None = None,
         return_dict: Optional[bool] = None,
         training: Optional[bool] = False,
     ) -> Union[tuple, TFImageClassifierOutputWithNoAttention]:
@@ -925,10 +883,6 @@ class TFMobileViTForImageClassification(TFMobileViTPreTrainedModel, TFSequenceCl
             return ((loss,) + output) if loss is not None else output
 
         return TFImageClassifierOutputWithNoAttention(loss=loss, logits=logits, hidden_states=outputs.hidden_states)
-
-    def serving_output(self, output: TFImageClassifierOutputWithNoAttention) -> TFImageClassifierOutputWithNoAttention:
-        # hidden_states and attention not converted to Tensor with tf.convert_to_tensor as they are all of different dimensions
-        return TFImageClassifierOutputWithNoAttention(logits=output.logits, hidden_states=output.hidden_states)
 
 
 class TFMobileViTASPPPooling(tf.keras.layers.Layer):
@@ -1087,8 +1041,8 @@ class TFMobileViTForSemanticSegmentation(TFMobileViTPreTrainedModel):
     @replace_return_docstrings(output_type=TFSemanticSegmenterOutputWithNoAttention, config_class=_CONFIG_FOR_DOC)
     def call(
         self,
-        pixel_values: Optional[tf.Tensor] = None,
-        labels: Optional[tf.Tensor] = None,
+        pixel_values: tf.Tensor | None = None,
+        labels: tf.Tensor | None = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         training: bool = False,
@@ -1103,17 +1057,17 @@ class TFMobileViTForSemanticSegmentation(TFMobileViTPreTrainedModel):
         Examples:
 
         ```python
-        >>> from transformers import MobileViTFeatureExtractor, TFMobileViTForSemanticSegmentation
+        >>> from transformers import AutoImageProcessor, TFMobileViTForSemanticSegmentation
         >>> from PIL import Image
         >>> import requests
 
         >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
         >>> image = Image.open(requests.get(url, stream=True).raw)
 
-        >>> feature_extractor = MobileViTFeatureExtractor.from_pretrained("apple/deeplabv3-mobilevit-small")
+        >>> image_processor = AutoImageProcessor.from_pretrained("apple/deeplabv3-mobilevit-small")
         >>> model = TFMobileViTForSemanticSegmentation.from_pretrained("apple/deeplabv3-mobilevit-small")
 
-        >>> inputs = feature_extractor(images=image, return_tensors="tf")
+        >>> inputs = image_processor(images=image, return_tensors="tf")
 
         >>> outputs = model(**inputs)
 
@@ -1159,8 +1113,3 @@ class TFMobileViTForSemanticSegmentation(TFMobileViTPreTrainedModel):
             logits=logits,
             hidden_states=outputs.hidden_states if output_hidden_states else None,
         )
-
-    def serving_output(
-        self, output: TFSemanticSegmenterOutputWithNoAttention
-    ) -> TFSemanticSegmenterOutputWithNoAttention:
-        return TFSemanticSegmenterOutputWithNoAttention(logits=output.logits, hidden_states=output.hidden_states)

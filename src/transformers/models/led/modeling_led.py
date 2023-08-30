@@ -16,7 +16,7 @@
 
 
 import math
-import random
+import warnings
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -50,7 +50,6 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "allenai/led-base-16384"
 _CONFIG_FOR_DOC = "LEDConfig"
-_TOKENIZER_FOR_DOC = "LEDTokenizer"
 
 
 LED_PRETRAINED_MODEL_ARCHIVE_LIST = [
@@ -80,7 +79,7 @@ def _make_causal_mask(input_ids_shape: torch.Size, dtype: torch.dtype, past_key_
     Make causal mask used for bi-directional self-attention.
     """
     bsz, tgt_len = input_ids_shape
-    mask = torch.full((tgt_len, tgt_len), torch.tensor(torch.finfo(dtype).min))
+    mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min)
     mask_cond = torch.arange(mask.size(-1))
     mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
     mask = mask.to(dtype)
@@ -391,7 +390,7 @@ class LEDEncoderSelfAttention(nn.Module):
         return chunked_hidden_states
 
     @staticmethod
-    def _chunk(hidden_states, window_overlap, onnx_export=False):
+    def _chunk(hidden_states, window_overlap, onnx_export: bool = False):
         """convert into overlapping chunks. Chunk size = 2w, overlap size = w"""
         if not onnx_export:
             # non-overlapping chunks of size = 2w
@@ -410,29 +409,26 @@ class LEDEncoderSelfAttention(nn.Module):
             return hidden_states.as_strided(size=chunk_size, stride=chunk_stride)
 
         # When exporting to ONNX, use this separate logic
-        if hidden_states.size(1) == window_overlap * 2:
-            # simplest case
-            return hidden_states.unsqueeze(1)
-        else:
-            # have to use slow implementation since as_strided, unfold and 2d-tensor indexing aren't supported (yet) in ONNX export
+        # have to use slow implementation since as_strided, unfold and 2d-tensor indexing aren't supported (yet) in ONNX export
 
-            # TODO replace this with
-            # > return hidden_states.unfold(dimension=1, size=window_overlap * 2, step=window_overlap).transpose(2, 3)
-            # once `unfold` is supported
+        # TODO replace this with
+        # > return hidden_states.unfold(dimension=1, size=window_overlap * 2, step=window_overlap).transpose(2, 3)
+        # once `unfold` is supported
+        # the case hidden_states.size(1) == window_overlap * 2 can also simply return hidden_states.unsqueeze(1), but that's control flow
 
-            chunk_size = [
-                hidden_states.size(0),
-                hidden_states.size(1) // window_overlap - 1,
-                window_overlap * 2,
-                hidden_states.size(2),
+        chunk_size = [
+            hidden_states.size(0),
+            torch.div(hidden_states.size(1), window_overlap, rounding_mode="trunc") - 1,
+            window_overlap * 2,
+            hidden_states.size(2),
+        ]
+
+        overlapping_chunks = torch.empty(chunk_size, device=hidden_states.device)
+        for chunk in range(chunk_size[1]):
+            overlapping_chunks[:, chunk, :, :] = hidden_states[
+                :, chunk * window_overlap : chunk * window_overlap + 2 * window_overlap, :
             ]
-
-            overlapping_chunks = torch.empty(chunk_size)
-            for chunk in range(chunk_size[1]):
-                overlapping_chunks[:, chunk, :, :] = hidden_states[
-                    :, chunk * window_overlap : chunk * window_overlap + 2 * window_overlap, :
-                ]
-            return overlapping_chunks
+        return overlapping_chunks
 
     @staticmethod
     def _mask_invalid_locations(input_tensor, affected_seq_len) -> torch.Tensor:
@@ -468,8 +464,8 @@ class LEDEncoderSelfAttention(nn.Module):
         query = query.transpose(1, 2).reshape(batch_size * num_heads, seq_len, head_dim)
         key = key.transpose(1, 2).reshape(batch_size * num_heads, seq_len, head_dim)
 
-        query = self._chunk(query, window_overlap, self.config.__dict__.get("onnx_export", False))
-        key = self._chunk(key, window_overlap, self.config.__dict__.get("onnx_export", False))
+        query = self._chunk(query, window_overlap, getattr(self.config, "onnx_export", False))
+        key = self._chunk(key, window_overlap, getattr(self.config, "onnx_export", False))
 
         # matrix multiplication
         # bcxd: batch_size * num_heads x chunks x 2window_overlap x head_dim
@@ -966,7 +962,7 @@ class LEDEncoderLayer(nn.Module):
     ):
         """
         Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape *(seq_len, batch, embed_dim)*
+            hidden_states (`torch.FloatTensor`): input to the layer of shape *(batch, seq_len, embed_dim)*
             attention_mask (`torch.FloatTensor`): attention mask of size
                 *(batch, 1, tgt_len, src_len)* where padding elements are indicated by very large negative values.
             layer_head_mask (`torch.FloatTensor`): mask for attention heads in a given layer of size
@@ -1044,11 +1040,11 @@ class LEDDecoderLayer(nn.Module):
     ):
         """
         Args:
-            hidden_states (`torch.FloatTensor`): input to the layer of shape *(seq_len, batch, embed_dim)*
+            hidden_states (`torch.FloatTensor`): input to the layer of shape *(batch, seq_len, embed_dim)*
             attention_mask (`torch.FloatTensor`): attention mask of size
                 *(batch, 1, tgt_len, src_len)* where padding elements are indicated by very large negative values.
             encoder_hidden_states (`torch.FloatTensor`):
-                cross attention input to the layer of shape *(seq_len, batch, embed_dim)*
+                cross attention input to the layer of shape *(batch, seq_len, embed_dim)*
             encoder_attention_mask (`torch.FloatTensor`): encoder attention mask of size
                 *(batch, 1, tgt_len, src_len)* where padding elements are indicated by very large negative values.
             layer_head_mask (`torch.FloatTensor`): mask for attention heads in a given layer of size
@@ -1509,10 +1505,10 @@ LED_GENERATION_EXAMPLE = r"""
 
     ```python
     >>> import torch
-    >>> from transformers import LEDTokenizer, LEDForConditionalGeneration
+    >>> from transformers import AutoTokenizer, LEDForConditionalGeneration
 
     >>> model = LEDForConditionalGeneration.from_pretrained("allenai/led-large-16384-arxiv")
-    >>> tokenizer = LEDTokenizer.from_pretrained("allenai/led-large-16384-arxiv")
+    >>> tokenizer = AutoTokenizer.from_pretrained("allenai/led-large-16384-arxiv")
 
     >>> ARTICLE_TO_SUMMARIZE = '''Transformers (Vaswani et al., 2017) have achieved state-of-the-art
     ...     results in a wide range of natural language tasks including generative language modeling
@@ -1548,7 +1544,7 @@ LED_INPUTS_DOCSTRING = r"""
             Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you provide
             it.
 
-            Indices can be obtained using [`LEDTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
 
             [What are input IDs?](../glossary#input-ids)
@@ -1766,7 +1762,7 @@ class LEDEncoder(LEDPreTrainedModel):
                 Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
                 provide it.
 
-                Indices can be obtained using [`LEDTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+                Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
                 [`PreTrainedTokenizer.__call__`] for details.
 
                 [What are input IDs?](../glossary#input-ids)
@@ -1874,7 +1870,7 @@ class LEDEncoder(LEDPreTrainedModel):
             if output_hidden_states:
                 encoder_states = encoder_states + (hidden_states,)
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
-            dropout_probability = random.uniform(0, 1)
+            dropout_probability = torch.rand([])
 
             if self.training and (dropout_probability < self.layerdrop):  # skip the layer
                 layer_outputs = (None, None, None)
@@ -1994,7 +1990,7 @@ class LEDDecoder(LEDPreTrainedModel):
                 Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
                 provide it.
 
-                Indices can be obtained using [`LEDTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+                Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
                 [`PreTrainedTokenizer.__call__`] for details.
 
                 [What are input IDs?](../glossary#input-ids)
@@ -2113,6 +2109,13 @@ class LEDDecoder(LEDPreTrainedModel):
 
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
 
+        if self.gradient_checkpointing and self.training:
+            if use_cache:
+                logger.warning_once(
+                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
+                )
+                use_cache = False
+
         # decoder layers
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
@@ -2131,19 +2134,14 @@ class LEDDecoder(LEDPreTrainedModel):
             # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
-            dropout_probability = random.uniform(0, 1)
-            if self.training and (dropout_probability < self.layerdrop):
-                continue
+            if self.training:
+                dropout_probability = torch.rand([])
+                if dropout_probability < self.layerdrop:
+                    continue
 
             past_key_value = past_key_values[idx] if past_key_values is not None else None
 
             if self.gradient_checkpointing and self.training:
-
-                if use_cache:
-                    logger.warning(
-                        "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                    )
-                    use_cache = False
 
                 def create_custom_forward(module):
                     def custom_forward(*inputs):
@@ -2211,6 +2209,8 @@ class LEDDecoder(LEDPreTrainedModel):
     LED_START_DOCSTRING,
 )
 class LEDModel(LEDPreTrainedModel):
+    _tied_weights_keys = ["decoder.embed_tokens.weight", "encoder.embed_tokens.weight"]
+
     def __init__(self, config: LEDConfig):
         super().__init__(config)
 
@@ -2239,7 +2239,6 @@ class LEDModel(LEDPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(LED_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=Seq2SeqModelOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -2335,12 +2334,8 @@ class LEDModel(LEDPreTrainedModel):
 )
 class LEDForConditionalGeneration(LEDPreTrainedModel):
     base_model_prefix = "led"
-    _keys_to_ignore_on_load_missing = [
-        r"final_logits_bias",
-        r"encoder.version",
-        r"decoder.version",
-        r"lm_head.weight",
-    ]
+    _keys_to_ignore_on_load_missing = ["final_logits_bias"]
+    _tied_weights_keys = ["decoder.embed_tokens.weight", "encoder.embed_tokens.weight", "lm_head.weight"]
 
     def __init__(self, config: LEDConfig):
         super().__init__(config)
@@ -2357,9 +2352,9 @@ class LEDForConditionalGeneration(LEDPreTrainedModel):
     def get_decoder(self):
         return self.led.get_decoder()
 
-    def resize_token_embeddings(self, new_num_tokens: int) -> nn.Embedding:
-        new_embeddings = super().resize_token_embeddings(new_num_tokens)
-        self._resize_final_logits_bias(new_num_tokens)
+    def resize_token_embeddings(self, new_num_tokens: int, pad_to_multiple_of: Optional[int] = None) -> nn.Embedding:
+        new_embeddings = super().resize_token_embeddings(new_num_tokens, pad_to_multiple_of)
+        self._resize_final_logits_bias(new_embeddings.weight.shape[0])
         return new_embeddings
 
     def _resize_final_logits_bias(self, new_num_tokens: int) -> None:
@@ -2411,9 +2406,9 @@ class LEDForConditionalGeneration(LEDPreTrainedModel):
         Conditional generation example:
 
         ```python
-        >>> from transformers import LEDTokenizer, LEDForConditionalGeneration
+        >>> from transformers import AutoTokenizer, LEDForConditionalGeneration
 
-        >>> tokenizer = LEDTokenizer.from_pretrained("allenai/led-base-16384")
+        >>> tokenizer = AutoTokenizer.from_pretrained("allenai/led-base-16384")
         >>> TXT = "My friends are <mask> but they eat too many carbs."
 
         >>> model = LEDForConditionalGeneration.from_pretrained("allenai/led-base-16384")
@@ -2428,7 +2423,7 @@ class LEDForConditionalGeneration(LEDPreTrainedModel):
             if use_cache:
                 logger.warning("The `use_cache` argument is changed to `False` since `labels` is provided.")
             use_cache = False
-            if decoder_input_ids is None:
+            if decoder_input_ids is None and decoder_inputs_embeds is None:
                 decoder_input_ids = shift_tokens_right(
                     labels, self.config.pad_token_id, self.config.decoder_start_token_id
                 )
@@ -2478,7 +2473,7 @@ class LEDForConditionalGeneration(LEDPreTrainedModel):
     def prepare_inputs_for_generation(
         self,
         decoder_input_ids,
-        past=None,
+        past_key_values=None,
         attention_mask=None,
         global_attention_mask=None,
         head_mask=None,
@@ -2489,13 +2484,13 @@ class LEDForConditionalGeneration(LEDPreTrainedModel):
         **kwargs,
     ):
         # cut decoder_input_ids if past is used
-        if past is not None:
+        if past_key_values is not None:
             decoder_input_ids = decoder_input_ids[:, -1:]
 
         return {
             "input_ids": None,  # encoder_outputs is defined. input_ids not needed
             "encoder_outputs": encoder_outputs,
-            "past_key_values": past,
+            "past_key_values": past_key_values,
             "decoder_input_ids": decoder_input_ids,
             "attention_mask": attention_mask,
             "global_attention_mask": global_attention_mask,
@@ -2509,9 +2504,9 @@ class LEDForConditionalGeneration(LEDPreTrainedModel):
         return shift_tokens_right(labels, self.config.pad_token_id, self.config.decoder_start_token_id)
 
     @staticmethod
-    def _reorder_cache(past, beam_idx):
+    def _reorder_cache(past_key_values, beam_idx):
         reordered_past = ()
-        for layer_past in past:
+        for layer_past in past_key_values:
             # cached cross_attention states don't have to be reordered -> they are always the same
             reordered_past += (
                 tuple(past_state.index_select(0, beam_idx) for past_state in layer_past[:2]) + layer_past[2:],
@@ -2527,7 +2522,15 @@ class LEDForConditionalGeneration(LEDPreTrainedModel):
     LED_START_DOCSTRING,
 )
 class LEDForSequenceClassification(LEDPreTrainedModel):
+    _tied_weights_keys = ["decoder.embed_tokens.weight", "encoder.embed_tokens.weight"]
+
     def __init__(self, config: LEDConfig, **kwargs):
+        warnings.warn(
+            "The `transformers.LEDForSequenceClassification` class is deprecated and will be removed in version 5 of"
+            " Transformers. No actual method were provided in the original paper on how to perfom"
+            " sequence classification.",
+            FutureWarning,
+        )
         super().__init__(config, **kwargs)
         self.led = LEDModel(config)
         self.classification_head = LEDClassificationHead(
@@ -2536,12 +2539,12 @@ class LEDForSequenceClassification(LEDPreTrainedModel):
             config.num_labels,
             config.classifier_dropout,
         )
-        self.led._init_weights(self.classification_head.dense)
-        self.led._init_weights(self.classification_head.out_proj)
+
+        # Initialize weights and apply final processing
+        self.post_init()
 
     @add_start_docstrings_to_model_forward(LED_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=Seq2SeqSequenceClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -2598,7 +2601,7 @@ class LEDForSequenceClassification(LEDPreTrainedModel):
         )
         hidden_states = outputs[0]  # last hidden state
 
-        eos_mask = input_ids.eq(self.config.eos_token_id)
+        eos_mask = input_ids.eq(self.config.eos_token_id).to(hidden_states.device)
 
         if len(torch.unique_consecutive(eos_mask.sum(1))) > 1:
             raise ValueError("All examples must have the same number of <eos> tokens.")
@@ -2655,6 +2658,8 @@ class LEDForSequenceClassification(LEDPreTrainedModel):
     LED_START_DOCSTRING,
 )
 class LEDForQuestionAnswering(LEDPreTrainedModel):
+    _tied_weights_keys = ["decoder.embed_tokens.weight", "encoder.embed_tokens.weight"]
+
     def __init__(self, config):
         super().__init__(config)
 
@@ -2664,11 +2669,11 @@ class LEDForQuestionAnswering(LEDPreTrainedModel):
         self.led = LEDModel(config)
         self.qa_outputs = nn.Linear(config.hidden_size, config.num_labels)
 
-        self.led._init_weights(self.qa_outputs)
+        # Initialize weights and apply final processing
+        self.post_init()
 
     @add_start_docstrings_to_model_forward(LED_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=Seq2SeqQuestionAnsweringModelOutput,
         config_class=_CONFIG_FOR_DOC,

@@ -25,6 +25,7 @@ from transformers.utils import cached_property, is_torch_available, is_vision_av
 
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import ModelTesterMixin, _config_zero_init, floats_tensor, ids_tensor
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
@@ -43,7 +44,7 @@ if is_torch_available():
 if is_vision_available():
     from PIL import Image
 
-    from transformers import BeitFeatureExtractor
+    from transformers import BeitImageProcessor
 
 
 class Data2VecVisionModelTester:
@@ -58,7 +59,7 @@ class Data2VecVisionModelTester:
         is_training=True,
         use_labels=True,
         hidden_size=32,
-        num_hidden_layers=4,
+        num_hidden_layers=2,
         num_attention_heads=4,
         intermediate_size=37,
         hidden_act="gelu",
@@ -165,7 +166,7 @@ class Data2VecVisionModelTester:
 
 
 @require_torch
-class Data2VecVisionModelTest(ModelTesterMixin, unittest.TestCase):
+class Data2VecVisionModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     """
     Here we also overwrite some of the tests of test_modeling_common.py, as Data2VecVision does not use input_ids, inputs_embeds,
     attention_mask and seq_length.
@@ -175,6 +176,15 @@ class Data2VecVisionModelTest(ModelTesterMixin, unittest.TestCase):
         (Data2VecVisionModel, Data2VecVisionForImageClassification, Data2VecVisionForSemanticSegmentation)
         if is_torch_available()
         else ()
+    )
+    pipeline_model_mapping = (
+        {
+            "feature-extraction": Data2VecVisionModel,
+            "image-classification": Data2VecVisionForImageClassification,
+            "image-segmentation": Data2VecVisionForSemanticSegmentation,
+        }
+        if is_torch_available()
+        else {}
     )
 
     test_pruning = False
@@ -317,11 +327,9 @@ def prepare_img():
 @require_vision
 class Data2VecVisionModelIntegrationTest(unittest.TestCase):
     @cached_property
-    def default_feature_extractor(self):
+    def default_image_processor(self):
         return (
-            BeitFeatureExtractor.from_pretrained("facebook/data2vec-vision-base-ft1k")
-            if is_vision_available()
-            else None
+            BeitImageProcessor.from_pretrained("facebook/data2vec-vision-base-ft1k") if is_vision_available() else None
         )
 
     @slow
@@ -330,9 +338,9 @@ class Data2VecVisionModelIntegrationTest(unittest.TestCase):
             torch_device
         )
 
-        feature_extractor = self.default_feature_extractor
+        image_processor = self.default_image_processor
         image = prepare_img()
-        inputs = feature_extractor(images=image, return_tensors="pt").to(torch_device)
+        inputs = image_processor(images=image, return_tensors="pt").to(torch_device)
 
         # forward pass
         with torch.no_grad():

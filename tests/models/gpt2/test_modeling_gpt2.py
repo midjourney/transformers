@@ -15,15 +15,17 @@
 
 
 import datetime
+import gc
 import math
 import unittest
 
 from transformers import GPT2Config, is_torch_available
 from transformers.testing_utils import require_torch, slow, torch_device
 
-from ...generation.test_generation_utils import GenerationTesterMixin
+from ...generation.test_utils import GenerationTesterMixin
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import ModelTesterMixin, floats_tensor, ids_tensor, random_attention_mask
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
@@ -32,6 +34,7 @@ if is_torch_available():
     from transformers import (
         GPT2_PRETRAINED_MODEL_ARCHIVE_LIST,
         GPT2DoubleHeadsModel,
+        GPT2ForQuestionAnswering,
         GPT2ForSequenceClassification,
         GPT2ForTokenClassification,
         GPT2LMHeadModel,
@@ -53,7 +56,7 @@ class GPT2ModelTester:
         use_mc_token_ids=True,
         vocab_size=99,
         hidden_size=32,
-        num_hidden_layers=5,
+        num_hidden_layers=2,
         num_attention_heads=4,
         intermediate_size=37,
         hidden_act="gelu",
@@ -376,6 +379,17 @@ class GPT2ModelTester:
         )
         self.parent.assertEqual(result.mc_logits.shape, (self.batch_size, self.num_choices))
 
+    def create_and_check_gpt2_for_question_answering(
+        self, config, input_ids, input_mask, head_mask, token_type_ids, mc_token_ids, sequence_labels, *args
+    ):
+        config.num_labels = self.num_labels
+        model = GPT2ForQuestionAnswering(config)
+        model.to(torch_device)
+        model.eval()
+        result = model(input_ids, attention_mask=input_mask, token_type_ids=token_type_ids)
+        self.parent.assertEqual(result.start_logits.shape, (self.batch_size, self.seq_length))
+        self.parent.assertEqual(result.end_logits.shape, (self.batch_size, self.seq_length))
+
     def create_and_check_gpt2_for_sequence_classification(
         self, config, input_ids, input_mask, head_mask, token_type_ids, mc_token_ids, sequence_labels, *args
     ):
@@ -429,14 +443,32 @@ class GPT2ModelTester:
 
 
 @require_torch
-class GPT2ModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
-
+class GPT2ModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (
-        (GPT2Model, GPT2LMHeadModel, GPT2DoubleHeadsModel, GPT2ForSequenceClassification, GPT2ForTokenClassification)
+        (
+            GPT2Model,
+            GPT2LMHeadModel,
+            GPT2DoubleHeadsModel,
+            GPT2ForQuestionAnswering,
+            GPT2ForSequenceClassification,
+            GPT2ForTokenClassification,
+        )
         if is_torch_available()
         else ()
     )
     all_generative_model_classes = (GPT2LMHeadModel, GPT2DoubleHeadsModel) if is_torch_available() else ()
+    pipeline_model_mapping = (
+        {
+            "feature-extraction": GPT2Model,
+            "question-answering": GPT2ForQuestionAnswering,
+            "text-classification": GPT2ForSequenceClassification,
+            "text-generation": GPT2LMHeadModel,
+            "token-classification": GPT2ForTokenClassification,
+            "zero-shot": GPT2ForSequenceClassification,
+        }
+        if is_torch_available()
+        else {}
+    )
     all_parallelizable_model_classes = (GPT2LMHeadModel, GPT2DoubleHeadsModel) if is_torch_available() else ()
     fx_compatible = True
     test_missing_keys = False
@@ -469,6 +501,12 @@ class GPT2ModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
         self.model_tester = GPT2ModelTester(self)
         self.config_tester = ConfigTester(self, config_class=GPT2Config, n_embd=37)
 
+    def tearDown(self):
+        super().tearDown()
+        # clean-up as much as possible GPU memory occupied by PyTorch
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def test_config(self):
         self.config_tester.run_common_tests()
 
@@ -495,6 +533,10 @@ class GPT2ModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
     def test_gpt2_double_lm_head_model(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_double_lm_head_model(*config_and_inputs)
+
+    def test_gpt2_question_answering_model(self):
+        config_and_inputs = self.model_tester.prepare_config_and_inputs()
+        self.model_tester.create_and_check_gpt2_for_question_answering(*config_and_inputs)
 
     def test_gpt2_sequence_classification_model(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
@@ -648,6 +690,12 @@ class GPT2ModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
 
 @require_torch
 class GPT2ModelLanguageGenerationTest(unittest.TestCase):
+    def tearDown(self):
+        super().tearDown()
+        # clean-up as much as possible GPU memory occupied by PyTorch
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def _test_lm_generate_gpt2_helper(
         self,
         gradient_checkpointing=False,
@@ -720,7 +768,7 @@ class GPT2ModelLanguageGenerationTest(unittest.TestCase):
         )
         self.assertEqual(output_str, EXPECTED_OUTPUT_STR)
         self.assertTrue(
-            all([output_seq_strs[idx] != output_seq_tt_strs[idx] for idx in range(len(output_seq_tt_strs))])
+            all(output_seq_strs[idx] != output_seq_tt_strs[idx] for idx in range(len(output_seq_tt_strs)))
         )  # token_type_ids should change output
 
     @slow
@@ -763,3 +811,37 @@ class GPT2ModelLanguageGenerationTest(unittest.TestCase):
         model.generate(input_ids, do_sample=False, max_time=None, max_length=256)
         duration = datetime.datetime.now() - start
         self.assertGreater(duration, datetime.timedelta(seconds=1.5 * MAX_TIME))
+
+    @slow
+    def test_contrastive_search_gpt2(self):
+        article = (
+            "DeepMind Technologies is a British artificial intelligence subsidiary of Alphabet Inc. and research "
+            "laboratory founded in 2010. DeepMind was acquired by Google in 2014. The company is based"
+        )
+
+        gpt2_tokenizer = GPT2Tokenizer.from_pretrained("gpt2-large")
+        gpt2_model = GPT2LMHeadModel.from_pretrained("gpt2-large").to(torch_device)
+        input_ids = gpt2_tokenizer(article, return_tensors="pt").input_ids.to(torch_device)
+
+        outputs = gpt2_model.generate(input_ids, penalty_alpha=0.6, top_k=4, max_length=256)
+
+        generated_text = gpt2_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+
+        self.assertListEqual(
+            generated_text,
+            [
+                "DeepMind Technologies is a British artificial intelligence subsidiary of Alphabet Inc. and research "
+                "laboratory founded in 2010. DeepMind was acquired by Google in 2014. The company is based in London, "
+                "United Kingdom\n\nGoogle has a lot of data on its users and uses it to improve its products, such as "
+                "Google Now, which helps users find the information they're looking for on the web. But the company "
+                "is not the only one to collect data on its users. Facebook, for example, has its own facial "
+                "recognition technology, as well as a database of millions of photos that it uses to personalize its "
+                "News Feed.\n\nFacebook's use of data is a hot topic in the tech industry, with privacy advocates "
+                "concerned about the company's ability to keep users' information private. In a blog post last "
+                'year, Facebook CEO Mark Zuckerberg said his company would "do our best to be transparent about our '
+                'data use and how we use it."\n\n"We have made it clear that we do not sell or share your data with '
+                'third parties," Zuckerberg wrote. "If you have questions or concerns, please reach out to us at '
+                'privacy@facebook.com."\n\nGoogle declined to comment on the privacy implications of its use of data, '
+                "but said in a statement to The Associated Press that"
+            ],
+        )

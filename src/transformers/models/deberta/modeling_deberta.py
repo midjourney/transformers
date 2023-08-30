@@ -38,7 +38,6 @@ from .configuration_deberta import DebertaConfig
 
 logger = logging.get_logger(__name__)
 _CONFIG_FOR_DOC = "DebertaConfig"
-_TOKENIZER_FOR_DOC = "DebertaTokenizer"
 _CHECKPOINT_FOR_DOC = "microsoft/deberta-base"
 
 # Masked LM docstring
@@ -46,25 +45,12 @@ _CHECKPOINT_FOR_MASKED_LM = "lsanochkin/deberta-large-feedback"
 _MASKED_LM_EXPECTED_OUTPUT = "' Paris'"
 _MASKED_LM_EXPECTED_LOSS = "0.54"
 
-# TokenClassification docstring
-_CHECKPOINT_FOR_TOKEN_CLASSIFICATION = "dbsamu/deberta-base-finetuned-ner"
-_TOKEN_CLASS_EXPECTED_OUTPUT = (
-    "['LABEL_0', 'LABEL_0', 'LABEL_0', 'LABEL_0', 'LABEL_0', 'LABEL_0', 'LABEL_0', 'LABEL_0', 'LABEL_0', 'LABEL_0',"
-    " 'LABEL_0', 'LABEL_0']"
-)
-_TOKEN_CLASS_EXPECTED_LOSS = 0.04
-
 # QuestionAnswering docstring
 _CHECKPOINT_FOR_QA = "Palak/microsoft_deberta-large_squad"
 _QA_EXPECTED_OUTPUT = "' a nice puppet'"
 _QA_EXPECTED_LOSS = 0.14
 _QA_TARGET_START_INDEX = 12
 _QA_TARGET_END_INDEX = 14
-
-# SequenceClassification docstring
-_CHECKPOINT_FOR_SEQUENCE_CLASSIFICATION = "hf-internal-testing/tiny-random-deberta"
-_SEQ_CLASS_EXPECTED_OUTPUT = "'LABEL_0'"
-_SEQ_CLASS_EXPECTED_LOSS = "0.69"
 
 
 DEBERTA_PRETRAINED_MODEL_ARCHIVE_LIST = [
@@ -153,13 +139,13 @@ class XSoftmax(torch.autograd.Function):
         r_mask = g.op(
             "Cast",
             g.op("Sub", g.op("Constant", value_t=torch.tensor(1, dtype=torch.int64)), mask_cast_value),
-            to_i=sym_help.cast_pytorch_to_onnx["Byte"],
+            to_i=sym_help.cast_pytorch_to_onnx["Bool"],
         )
         output = masked_fill(
             g, self, r_mask, g.op("Constant", value_t=torch.tensor(torch.finfo(self.type().dtype()).min))
         )
         output = softmax(g, output, dim)
-        return masked_fill(g, output, r_mask, g.op("Constant", value_t=torch.tensor(0, dtype=torch.uint8)))
+        return masked_fill(g, output, r_mask, g.op("Constant", value_t=torch.tensor(0, dtype=torch.bool)))
 
 
 class DropoutContext(object):
@@ -434,7 +420,6 @@ class DebertaEncoder(nn.Module):
         if attention_mask.dim() <= 2:
             extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
             attention_mask = extended_attention_mask * extended_attention_mask.squeeze(-2).unsqueeze(-1)
-            attention_mask = attention_mask.byte()
         elif attention_mask.dim() == 3:
             attention_mask = attention_mask.unsqueeze(1)
 
@@ -468,7 +453,6 @@ class DebertaEncoder(nn.Module):
             next_kv = hidden_states
         rel_embeddings = self.get_rel_embedding()
         for i, layer_module in enumerate(self.layer):
-
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
@@ -629,7 +613,7 @@ class DisentangledSelfAttention(nn.Module):
                 Input states to the module usually the output from previous layer, it will be the Q,K and V in
                 *Attention(Q,K,V)*
 
-            attention_mask (`torch.ByteTensor`):
+            attention_mask (`torch.BoolTensor`):
                 An attention mask matrix of shape [*B*, *N*, *N*] where *B* is the batch size, *N* is the maximum
                 sequence length in which element [i,j] = *1* means the *i* th token in the input can attend to the *j*
                 th token.
@@ -665,8 +649,8 @@ class DisentangledSelfAttention(nn.Module):
             qkvw = [torch.cat([ws[i * 3 + k] for i in range(self.num_attention_heads)], dim=0) for k in range(3)]
             qkvb = [None] * 3
 
-            q = linear(qkvw[0], qkvb[0], torch.tensor(query_states, dtype=qkvw[0].dtype))
-            k, v = [linear(qkvw[i], qkvb[i], torch.tensor(hidden_states, dtype=qkvw[i].dtype)) for i in range(1, 3)]
+            q = linear(qkvw[0], qkvb[0], query_states.to(dtype=qkvw[0].dtype))
+            k, v = [linear(qkvw[i], qkvb[i], hidden_states.to(dtype=qkvw[i].dtype)) for i in range(1, 3)]
             query_layer, key_layer, value_layer = [self.transpose_for_scores(x) for x in [q, k, v]]
 
         query_layer = query_layer + self.transpose_for_scores(self.q_bias[None, None, :])
@@ -676,7 +660,7 @@ class DisentangledSelfAttention(nn.Module):
         # Take the dot product between "query" and "key" to get the raw attention scores.
         scale_factor = 1 + len(self.pos_att_type)
         scale = torch.sqrt(torch.tensor(query_layer.size(-1), dtype=torch.float) * scale_factor)
-        query_layer = query_layer / torch.tensor(scale, dtype=query_layer.dtype)
+        query_layer = query_layer / scale.to(dtype=query_layer.dtype)
         attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
         if self.relative_attention:
             rel_embeddings = self.pos_dropout(rel_embeddings)
@@ -742,7 +726,7 @@ class DisentangledSelfAttention(nn.Module):
             else:
                 r_pos = relative_pos
             p2c_pos = torch.clamp(-r_pos + att_span, 0, att_span * 2 - 1)
-            p2c_att = torch.matmul(key_layer, torch.tensor(pos_query_layer.transpose(-1, -2), dtype=key_layer.dtype))
+            p2c_att = torch.matmul(key_layer, pos_query_layer.transpose(-1, -2).to(dtype=key_layer.dtype))
             p2c_att = torch.gather(
                 p2c_att, dim=-1, index=p2c_dynamic_expand(p2c_pos, query_layer, key_layer)
             ).transpose(-1, -2)
@@ -780,7 +764,9 @@ class DebertaEmbeddings(nn.Module):
         self.config = config
 
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
-        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
+        self.register_buffer(
+            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
+        )
 
     def forward(self, input_ids=None, token_type_ids=None, position_ids=None, mask=None, inputs_embeds=None):
         if input_ids is not None:
@@ -837,7 +823,6 @@ class DebertaPreTrainedModel(PreTrainedModel):
 
     config_class = DebertaConfig
     base_model_prefix = "deberta"
-    _keys_to_ignore_on_load_missing = ["position_ids"]
     _keys_to_ignore_on_load_unexpected = ["position_embeddings"]
     supports_gradient_checkpointing = True
 
@@ -881,7 +866,7 @@ DEBERTA_INPUTS_DOCSTRING = r"""
         input_ids (`torch.LongTensor` of shape `({0})`):
             Indices of input sequence tokens in the vocabulary.
 
-            Indices can be obtained using [`DebertaTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
 
             [What are input IDs?](../glossary#input-ids)
@@ -950,7 +935,6 @@ class DebertaModel(DebertaPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(DEBERTA_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=BaseModelOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -975,6 +959,7 @@ class DebertaModel(DebertaPreTrainedModel):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
+            self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
             input_shape = input_ids.size()
         elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
@@ -1037,8 +1022,7 @@ class DebertaModel(DebertaPreTrainedModel):
 
 @add_start_docstrings("""DeBERTa Model with a `language modeling` head on top.""", DEBERTA_START_DOCSTRING)
 class DebertaForMaskedLM(DebertaPreTrainedModel):
-    _keys_to_ignore_on_load_unexpected = [r"pooler"]
-    _keys_to_ignore_on_load_missing = [r"position_ids", r"predictions.decoder.bias"]
+    _tied_weights_keys = ["cls.predictions.decoder.weight", "cls.predictions.decoder.bias"]
 
     def __init__(self, config):
         super().__init__(config)
@@ -1057,7 +1041,6 @@ class DebertaForMaskedLM(DebertaPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(DEBERTA_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_MASKED_LM,
         output_type=MaskedLMOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -1117,16 +1100,17 @@ class DebertaForMaskedLM(DebertaPreTrainedModel):
         )
 
 
-# copied from transformers.models.bert.BertPredictionHeadTransform with bert -> deberta
 class DebertaPredictionHeadTransform(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.embedding_size = getattr(config, "embedding_size", config.hidden_size)
+
+        self.dense = nn.Linear(config.hidden_size, self.embedding_size)
         if isinstance(config.hidden_act, str):
             self.transform_act_fn = ACT2FN[config.hidden_act]
         else:
             self.transform_act_fn = config.hidden_act
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.LayerNorm = nn.LayerNorm(self.embedding_size, eps=config.layer_norm_eps)
 
     def forward(self, hidden_states):
         hidden_states = self.dense(hidden_states)
@@ -1135,15 +1119,15 @@ class DebertaPredictionHeadTransform(nn.Module):
         return hidden_states
 
 
-# copied from transformers.models.bert.BertLMPredictionHead with bert -> deberta
 class DebertaLMPredictionHead(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.transform = DebertaPredictionHeadTransform(config)
 
+        self.embedding_size = getattr(config, "embedding_size", config.hidden_size)
         # The output weights are the same as the input embeddings, but there is
         # an output-only bias for each token.
-        self.decoder = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.decoder = nn.Linear(self.embedding_size, config.vocab_size, bias=False)
 
         self.bias = nn.Parameter(torch.zeros(config.vocab_size))
 
@@ -1201,12 +1185,9 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(DEBERTA_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
-        checkpoint=_CHECKPOINT_FOR_SEQUENCE_CLASSIFICATION,
+        checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=SequenceClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
-        expected_output=_SEQ_CLASS_EXPECTED_OUTPUT,
-        expected_loss=_SEQ_CLASS_EXPECTED_LOSS,
     )
     def forward(
         self,
@@ -1296,8 +1277,6 @@ class DebertaForSequenceClassification(DebertaPreTrainedModel):
     DEBERTA_START_DOCSTRING,
 )
 class DebertaForTokenClassification(DebertaPreTrainedModel):
-    _keys_to_ignore_on_load_unexpected = [r"pooler"]
-
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
@@ -1311,12 +1290,9 @@ class DebertaForTokenClassification(DebertaPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(DEBERTA_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
-        checkpoint=_CHECKPOINT_FOR_TOKEN_CLASSIFICATION,
+        checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TokenClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
-        expected_output=_TOKEN_CLASS_EXPECTED_OUTPUT,
-        expected_loss=_TOKEN_CLASS_EXPECTED_LOSS,
     )
     def forward(
         self,
@@ -1374,8 +1350,6 @@ class DebertaForTokenClassification(DebertaPreTrainedModel):
     DEBERTA_START_DOCSTRING,
 )
 class DebertaForQuestionAnswering(DebertaPreTrainedModel):
-    _keys_to_ignore_on_load_unexpected = [r"pooler"]
-
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
@@ -1388,7 +1362,6 @@ class DebertaForQuestionAnswering(DebertaPreTrainedModel):
 
     @add_start_docstrings_to_model_forward(DEBERTA_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_QA,
         output_type=QuestionAnsweringModelOutput,
         config_class=_CONFIG_FOR_DOC,

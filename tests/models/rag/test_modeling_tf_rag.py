@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import os
 import shutil
@@ -16,9 +18,9 @@ from transformers.utils import cached_property, is_datasets_available, is_faiss_
 
 
 if is_tf_available() and is_datasets_available() and is_faiss_available():
+    import faiss
     import tensorflow as tf
     from datasets import Dataset
-    import faiss
 
     from transformers import (
         AutoConfig,
@@ -31,7 +33,6 @@ if is_tf_available() and is_datasets_available() and is_faiss_available():
         TFRagSequenceForGeneration,
         TFRagTokenForGeneration,
     )
-
     from transformers.modeling_tf_outputs import TFBaseModelOutput
 
 from ..bart.test_modeling_tf_bart import TFBartModelTester
@@ -58,7 +59,6 @@ def require_retrieval(test_case):
 @require_retrieval
 @require_sentencepiece
 class TFRagTestMixin:
-
     all_model_classes = (
         (TFRagModel, TFRagTokenForGeneration, TFRagSequenceForGeneration)
         if is_tf_available() and is_datasets_available() and is_faiss_available()
@@ -262,6 +262,7 @@ class TFRagTestMixin:
                 num_beams=2,
                 num_return_sequences=2,
                 decoder_start_token_id=config.generator.eos_token_id,
+                max_new_tokens=5,
             )
 
             self.assertIsNotNone(outputs)
@@ -392,7 +393,7 @@ class TFRagTestMixin:
         decoder_attention_mask,
         retriever_n_docs,
         generator_n_docs,
-        **kwargs
+        **kwargs,
     ):
         self.assertIsNotNone(config.question_encoder)
         self.assertIsNotNone(config.generator)
@@ -489,6 +490,7 @@ class TFRagTestMixin:
         inputs_dict = self.config_and_inputs
         self.check_model_without_retriever(**inputs_dict)
 
+    @slow
     def test_model_generate_from_context_input_ids(self):
         inputs_dict = self.config_and_inputs
         self.check_model_generate_from_context_input_ids(**inputs_dict)
@@ -497,6 +499,7 @@ class TFRagTestMixin:
         inputs_dict = self.config_and_inputs
         self.check_model_with_encoder_outputs(**inputs_dict)
 
+    @slow
     def test_model_generate(self):
         inputs_dict = self.config_and_inputs
         self.check_model_generate(**inputs_dict)

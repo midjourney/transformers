@@ -41,7 +41,6 @@ from .configuration_luke import LukeConfig
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "LukeConfig"
-_TOKENIZER_FOR_DOC = "LukeTokenizer"
 _CHECKPOINT_FOR_DOC = "studio-ousia/luke-base"
 
 LUKE_PRETRAINED_MODEL_ARCHIVE_LIST = [
@@ -902,6 +901,7 @@ class LukePreTrainedModel(PreTrainedModel):
     config_class = LukeConfig
     base_model_prefix = "luke"
     supports_gradient_checkpointing = True
+    _no_split_modules = ["LukeAttention", "LukeEntityEmbeddings"]
 
     def _init_weights(self, module: nn.Module):
         """Initialize the weights"""
@@ -946,7 +946,7 @@ LUKE_INPUTS_DOCSTRING = r"""
         input_ids (`torch.LongTensor` of shape `({0})`):
             Indices of input sequence tokens in the vocabulary.
 
-            Indices can be obtained using [`LukeTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
 
             [What are input IDs?](../glossary#input-ids)
@@ -974,7 +974,7 @@ LUKE_INPUTS_DOCSTRING = r"""
         entity_ids (`torch.LongTensor` of shape `(batch_size, entity_length)`):
             Indices of entity tokens in the entity vocabulary.
 
-            Indices can be obtained using [`LukeTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
 
         entity_attention_mask (`torch.FloatTensor` of shape `(batch_size, entity_length)`, *optional*):
@@ -1022,9 +1022,6 @@ LUKE_INPUTS_DOCSTRING = r"""
     LUKE_START_DOCSTRING,
 )
 class LukeModel(LukePreTrainedModel):
-
-    _keys_to_ignore_on_load_missing = [r"position_ids"]
-
     def __init__(self, config: LukeConfig, add_pooling_layer: bool = True):
         super().__init__(config)
         self.config = config
@@ -1078,9 +1075,9 @@ class LukeModel(LukePreTrainedModel):
         Examples:
 
         ```python
-        >>> from transformers import LukeTokenizer, LukeModel
+        >>> from transformers import AutoTokenizer, LukeModel
 
-        >>> tokenizer = LukeTokenizer.from_pretrained("studio-ousia/luke-base")
+        >>> tokenizer = AutoTokenizer.from_pretrained("studio-ousia/luke-base")
         >>> model = LukeModel.from_pretrained("studio-ousia/luke-base")
         # Compute the contextualized entity representation corresponding to the entity mention "Beyoncé"
 
@@ -1119,6 +1116,7 @@ class LukeModel(LukePreTrainedModel):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
+            self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
             input_shape = input_ids.size()
         elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
@@ -1264,7 +1262,11 @@ class LukeLMHead(nn.Module):
 
     def _tie_weights(self):
         # To tie those two weights if they get disconnected (on TPU or when the bias is resized)
-        self.bias = self.decoder.bias
+        # For accelerate compatibility and to not break backward compatibility
+        if self.decoder.bias.device.type == "meta":
+            self.decoder.bias = self.bias
+        else:
+            self.bias = self.decoder.bias
 
 
 @add_start_docstrings(
@@ -1275,17 +1277,7 @@ class LukeLMHead(nn.Module):
     LUKE_START_DOCSTRING,
 )
 class LukeForMaskedLM(LukePreTrainedModel):
-    _keys_to_ignore_on_save = [
-        r"lm_head.decoder.weight",
-        r"lm_head.decoder.bias",
-        r"entity_predictions.decoder.weight",
-    ]
-    _keys_to_ignore_on_load_missing = [
-        r"position_ids",
-        r"lm_head.decoder.weight",
-        r"lm_head.decoder.bias",
-        r"entity_predictions.decoder.weight",
-    ]
+    _tied_weights_keys = ["lm_head.decoder.weight", "lm_head.decoder.bias", "entity_predictions.decoder.weight"]
 
     def __init__(self, config):
         super().__init__(config)
@@ -1295,7 +1287,7 @@ class LukeForMaskedLM(LukePreTrainedModel):
         self.lm_head = LukeLMHead(config)
         self.entity_predictions = EntityPredictionHead(config)
 
-        self.loss_fn = nn.CrossEntropyLoss(ignore_index=-1)
+        self.loss_fn = nn.CrossEntropyLoss()
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1367,6 +1359,8 @@ class LukeForMaskedLM(LukePreTrainedModel):
         mlm_loss = None
         logits = self.lm_head(outputs.last_hidden_state)
         if labels is not None:
+            # move labels to correct device to enable model parallelism
+            labels = labels.to(logits.device)
             mlm_loss = self.loss_fn(logits.view(-1, self.config.vocab_size), labels.view(-1))
             if loss is None:
                 loss = mlm_loss
@@ -1462,9 +1456,9 @@ class LukeForEntityClassification(LukePreTrainedModel):
         Examples:
 
         ```python
-        >>> from transformers import LukeTokenizer, LukeForEntityClassification
+        >>> from transformers import AutoTokenizer, LukeForEntityClassification
 
-        >>> tokenizer = LukeTokenizer.from_pretrained("studio-ousia/luke-large-finetuned-open-entity")
+        >>> tokenizer = AutoTokenizer.from_pretrained("studio-ousia/luke-large-finetuned-open-entity")
         >>> model = LukeForEntityClassification.from_pretrained("studio-ousia/luke-large-finetuned-open-entity")
 
         >>> text = "Beyoncé lives in Los Angeles."
@@ -1502,6 +1496,8 @@ class LukeForEntityClassification(LukePreTrainedModel):
         if labels is not None:
             # When the number of dimension of `labels` is 1, cross entropy is used as the loss function. The binary
             # cross entropy is used otherwise.
+            # move labels to correct device to enable model parallelism
+            labels = labels.to(logits.device)
             if labels.ndim == 1:
                 loss = nn.functional.cross_entropy(logits, labels)
             else:
@@ -1575,9 +1571,9 @@ class LukeForEntityPairClassification(LukePreTrainedModel):
         Examples:
 
         ```python
-        >>> from transformers import LukeTokenizer, LukeForEntityPairClassification
+        >>> from transformers import AutoTokenizer, LukeForEntityPairClassification
 
-        >>> tokenizer = LukeTokenizer.from_pretrained("studio-ousia/luke-large-finetuned-tacred")
+        >>> tokenizer = AutoTokenizer.from_pretrained("studio-ousia/luke-large-finetuned-tacred")
         >>> model = LukeForEntityPairClassification.from_pretrained("studio-ousia/luke-large-finetuned-tacred")
 
         >>> text = "Beyoncé lives in Los Angeles."
@@ -1620,6 +1616,8 @@ class LukeForEntityPairClassification(LukePreTrainedModel):
         if labels is not None:
             # When the number of dimension of `labels` is 1, cross entropy is used as the loss function. The binary
             # cross entropy is used otherwise.
+            # move labels to correct device to enable model parallelism
+            labels = labels.to(logits.device)
             if labels.ndim == 1:
                 loss = nn.functional.cross_entropy(logits, labels)
             else:
@@ -1666,7 +1664,7 @@ class LukeForEntitySpanClassification(LukePreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
-        attention_mask=None,
+        attention_mask: Optional[torch.FloatTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         entity_ids: Optional[torch.LongTensor] = None,
@@ -1701,9 +1699,9 @@ class LukeForEntitySpanClassification(LukePreTrainedModel):
         Examples:
 
         ```python
-        >>> from transformers import LukeTokenizer, LukeForEntitySpanClassification
+        >>> from transformers import AutoTokenizer, LukeForEntitySpanClassification
 
-        >>> tokenizer = LukeTokenizer.from_pretrained("studio-ousia/luke-large-finetuned-conll-2003")
+        >>> tokenizer = AutoTokenizer.from_pretrained("studio-ousia/luke-large-finetuned-conll-2003")
         >>> model = LukeForEntitySpanClassification.from_pretrained("studio-ousia/luke-large-finetuned-conll-2003")
 
         >>> text = "Beyoncé lives in Los Angeles"
@@ -1746,9 +1744,15 @@ class LukeForEntitySpanClassification(LukePreTrainedModel):
         hidden_size = outputs.last_hidden_state.size(-1)
 
         entity_start_positions = entity_start_positions.unsqueeze(-1).expand(-1, -1, hidden_size)
+        if entity_start_positions.device != outputs.last_hidden_state.device:
+            entity_start_positions = entity_start_positions.to(outputs.last_hidden_state.device)
         start_states = torch.gather(outputs.last_hidden_state, -2, entity_start_positions)
+
         entity_end_positions = entity_end_positions.unsqueeze(-1).expand(-1, -1, hidden_size)
+        if entity_end_positions.device != outputs.last_hidden_state.device:
+            entity_end_positions = entity_end_positions.to(outputs.last_hidden_state.device)
         end_states = torch.gather(outputs.last_hidden_state, -2, entity_end_positions)
+
         feature_vector = torch.cat([start_states, end_states, outputs.entity_last_hidden_state], dim=2)
 
         feature_vector = self.dropout(feature_vector)
@@ -1756,6 +1760,8 @@ class LukeForEntitySpanClassification(LukePreTrainedModel):
 
         loss = None
         if labels is not None:
+            # move labels to correct device to enable model parallelism
+            labels = labels.to(logits.device)
             # When the number of dimension of `labels` is 2, cross entropy is used as the loss function. The binary
             # cross entropy is used otherwise.
             if labels.ndim == 2:
@@ -1801,7 +1807,6 @@ class LukeForSequenceClassification(LukePreTrainedModel):
 
     @add_start_docstrings_to_model_forward(LUKE_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=LukeSequenceClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -1854,6 +1859,8 @@ class LukeForSequenceClassification(LukePreTrainedModel):
 
         loss = None
         if labels is not None:
+            # move labels to correct device to enable model parallelism
+            labels = labels.to(logits.device)
             if self.config.problem_type is None:
                 if self.num_labels == 1:
                     self.config.problem_type = "regression"
@@ -1915,7 +1922,6 @@ class LukeForTokenClassification(LukePreTrainedModel):
 
     @add_start_docstrings_to_model_forward(LUKE_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=LukeTokenClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -1968,6 +1974,8 @@ class LukeForTokenClassification(LukePreTrainedModel):
 
         loss = None
         if labels is not None:
+            # move labels to correct device to enable model parallelism
+            labels = labels.to(logits.device)
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
 
@@ -2008,7 +2016,6 @@ class LukeForQuestionAnswering(LukePreTrainedModel):
 
     @add_start_docstrings_to_model_forward(LUKE_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=LukeQuestionAnsweringModelOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -2129,7 +2136,6 @@ class LukeForMultipleChoice(LukePreTrainedModel):
 
     @add_start_docstrings_to_model_forward(LUKE_INPUTS_DOCSTRING.format("batch_size, num_choices, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=LukeMultipleChoiceModelOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -2211,6 +2217,8 @@ class LukeForMultipleChoice(LukePreTrainedModel):
 
         loss = None
         if labels is not None:
+            # move labels to correct device to enable model parallelism
+            labels = labels.to(reshaped_logits.device)
             loss_fct = CrossEntropyLoss()
             loss = loss_fct(reshaped_logits, labels)
 
