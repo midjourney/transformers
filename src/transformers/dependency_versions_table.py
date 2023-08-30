@@ -20,7 +20,7 @@ deps = {
     "faiss-cpu": "faiss-cpu",
     "fastapi": "fastapi",
     "filelock": "filelock",
-    "flax": "flax>=0.4.1,<=0.7.0",
+    "flax": "flax>=0.4.1,<0.8",
     "ftfy": "ftfy",
     "fugashi": "fugashi>=1.0",
     "GitPython": "GitPython<3.1.19",
