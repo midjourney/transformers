@@ -48,8 +48,8 @@ class T5Config(PretrainedConfig):
         d_model (`int`, *optional*, defaults to 512):
             Size of the encoder layers and the pooler layer.
         d_kv (`int`, *optional*, defaults to 64):
-            Size of the key, query, value projections per attention head. `d_kv` has to be equal to `d_model //
-            num_heads`.
+            Size of the key, query, value projections per attention head. The `inner_dim` of the projection layer will
+            be defined as `num_heads * d_kv`.
         d_ff (`int`, *optional*, defaults to 2048):
             Size of the intermediate feed forward layer in each `T5Block`.
         num_layers (`int`, *optional*, defaults to 6):
@@ -64,6 +64,8 @@ class T5Config(PretrainedConfig):
             The maximum distance of the longer sequences for the bucket separation.
         dropout_rate (`float`, *optional*, defaults to 0.1):
             The ratio for all dropout layers.
+        classifier_dropout (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for classifier.
         layer_norm_eps (`float`, *optional*, defaults to 1e-6):
             The epsilon used by the layer normalization layers.
         initializer_factor (`float`, *optional*, defaults to 1):
@@ -98,7 +100,8 @@ class T5Config(PretrainedConfig):
         use_cache=True,
         pad_token_id=0,
         eos_token_id=1,
-        **kwargs
+        classifier_dropout=0.0,
+        **kwargs,
     ):
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -112,6 +115,7 @@ class T5Config(PretrainedConfig):
         self.relative_attention_num_buckets = relative_attention_num_buckets
         self.relative_attention_max_distance = relative_attention_max_distance
         self.dropout_rate = dropout_rate
+        self.classifier_dropout = classifier_dropout
         self.layer_norm_epsilon = layer_norm_epsilon
         self.initializer_factor = initializer_factor
         self.feed_forward_proj = feed_forward_proj

@@ -16,27 +16,26 @@
  Processing saving/loading class for common processors.
 """
 
-import importlib.util
 import os
+import warnings
 from pathlib import Path
+from typing import Optional, Union
 
 from .dynamic_module_utils import custom_object_save
 from .tokenization_utils_base import PreTrainedTokenizerBase
-from .utils import PushToHubMixin, copy_func, logging
+from .utils import PushToHubMixin, copy_func, direct_transformers_import, logging
 
 
 logger = logging.get_logger(__name__)
 
 # Dynamically import the Transformers module to grab the attribute classes of the processor form their names.
-spec = importlib.util.spec_from_file_location(
-    "transformers", Path(__file__).parent / "__init__.py", submodule_search_locations=[Path(__file__).parent]
-)
-transformers_module = spec.loader.load_module()
+transformers_module = direct_transformers_import(Path(__file__).parent)
 
 
 AUTO_TO_BASE_CLASS_MAPPING = {
     "AutoTokenizer": "PreTrainedTokenizerBase",
     "AutoFeatureExtractor": "FeatureExtractionMixin",
+    "AutoImageProcessor": "ImageProcessingMixin",
 }
 
 
@@ -56,7 +55,7 @@ class ProcessorMixin(PushToHubMixin):
         # Sanitize args and kwargs
         for key in kwargs:
             if key not in self.attributes:
-                raise TypeError(f"Unexepcted keyword argument {key}.")
+                raise TypeError(f"Unexpected keyword argument {key}.")
         for arg, attribute_name in zip(args, self.attributes):
             if attribute_name in kwargs:
                 raise TypeError(f"Got multiple values for argument {attribute_name}.")
@@ -99,8 +98,8 @@ class ProcessorMixin(PushToHubMixin):
         <Tip>
 
         This class method is simply calling [`~feature_extraction_utils.FeatureExtractionMixin.save_pretrained`] and
-        [`~tokenization_utils_base.PreTrainedTokenizer.save_pretrained`]. Please refer to the docstrings of the methods
-        above for more information.
+        [`~tokenization_utils_base.PreTrainedTokenizerBase.save_pretrained`]. Please refer to the docstrings of the
+        methods above for more information.
 
         </Tip>
 
@@ -112,15 +111,27 @@ class ProcessorMixin(PushToHubMixin):
                 Whether or not to push your model to the Hugging Face model hub after saving it. You can specify the
                 repository you want to push to with `repo_id` (will default to the name of `save_directory` in your
                 namespace).
-            kwargs:
+            kwargs (`Dict[str, Any]`, *optional*):
                 Additional key word arguments passed along to the [`~utils.PushToHubMixin.push_to_hub`] method.
         """
+        use_auth_token = kwargs.pop("use_auth_token", None)
+
+        if use_auth_token is not None:
+            warnings.warn(
+                "The `use_auth_token` argument is deprecated and will be removed in v5 of Transformers.", FutureWarning
+            )
+            if kwargs.get("token", None) is not None:
+                raise ValueError(
+                    "`token` and `use_auth_token` are both specified. Please set only the argument `token`."
+                )
+            kwargs["token"] = use_auth_token
+
         os.makedirs(save_directory, exist_ok=True)
 
         if push_to_hub:
             commit_message = kwargs.pop("commit_message", None)
             repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
-            repo_id, token = self._create_repo(repo_id, **kwargs)
+            repo_id = self._create_repo(repo_id, **kwargs)
             files_timestamps = self._get_files_timestamps(save_directory)
         # If we have a custom config, we copy the file defining it in the folder and set the attributes so it can be
         # loaded from the Hub.
@@ -146,18 +157,32 @@ class ProcessorMixin(PushToHubMixin):
 
         if push_to_hub:
             self._upload_modified_files(
-                save_directory, repo_id, files_timestamps, commit_message=commit_message, token=token
+                save_directory,
+                repo_id,
+                files_timestamps,
+                commit_message=commit_message,
+                token=kwargs.get("token"),
             )
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Union[str, os.PathLike],
+        cache_dir: Optional[Union[str, os.PathLike]] = None,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: Optional[Union[str, bool]] = None,
+        revision: str = "main",
+        **kwargs,
+    ):
         r"""
         Instantiate a processor associated with a pretrained model.
 
         <Tip>
 
         This class method is simply calling the feature extractor
-        [`~feature_extraction_utils.FeatureExtractionMixin.from_pretrained`] and the tokenizer
+        [`~feature_extraction_utils.FeatureExtractionMixin.from_pretrained`], image processor
+        [`~image_processing_utils.ImageProcessingMixin`] and the tokenizer
         [`~tokenization_utils_base.PreTrainedTokenizer.from_pretrained`] methods. Please refer to the docstrings of the
         methods above for more information.
 
@@ -179,6 +204,25 @@ class ProcessorMixin(PushToHubMixin):
                 [`~feature_extraction_utils.FeatureExtractionMixin.from_pretrained`] and
                 [`~tokenization_utils_base.PreTrainedTokenizer.from_pretrained`].
         """
+        kwargs["cache_dir"] = cache_dir
+        kwargs["force_download"] = force_download
+        kwargs["local_files_only"] = local_files_only
+        kwargs["revision"] = revision
+
+        use_auth_token = kwargs.pop("use_auth_token", None)
+        if use_auth_token is not None:
+            warnings.warn(
+                "The `use_auth_token` argument is deprecated and will be removed in v5 of Transformers.", FutureWarning
+            )
+            if token is not None:
+                raise ValueError(
+                    "`token` and `use_auth_token` are both specified. Please set only the argument `token`."
+                )
+            token = use_auth_token
+
+        if token is not None:
+            kwargs["token"] = token
+
         args = cls._get_arguments_from_pretrained(pretrained_model_name_or_path, **kwargs)
         return cls(*args)
 
@@ -226,8 +270,14 @@ class ProcessorMixin(PushToHubMixin):
             args.append(attribute_class.from_pretrained(pretrained_model_name_or_path, **kwargs))
         return args
 
+    @property
+    def model_input_names(self):
+        first_attribute = getattr(self, self.attributes[0])
+        return getattr(first_attribute, "model_input_names", None)
+
 
 ProcessorMixin.push_to_hub = copy_func(ProcessorMixin.push_to_hub)
-ProcessorMixin.push_to_hub.__doc__ = ProcessorMixin.push_to_hub.__doc__.format(
-    object="processor", object_class="AutoProcessor", object_files="processor files"
-)
+if ProcessorMixin.push_to_hub.__doc__ is not None:
+    ProcessorMixin.push_to_hub.__doc__ = ProcessorMixin.push_to_hub.__doc__.format(
+        object="processor", object_class="AutoProcessor", object_files="processor files"
+    )

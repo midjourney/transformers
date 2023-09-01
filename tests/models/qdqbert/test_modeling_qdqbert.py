@@ -23,6 +23,7 @@ from transformers.testing_utils import require_pytorch_quantization, require_tor
 
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import ModelTesterMixin, floats_tensor, ids_tensor, random_attention_mask
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
@@ -53,7 +54,7 @@ class QDQBertModelTester:
         use_labels=True,
         vocab_size=99,
         hidden_size=32,
-        num_hidden_layers=5,
+        num_hidden_layers=2,
         num_attention_heads=4,
         intermediate_size=37,
         hidden_act="gelu",
@@ -419,8 +420,7 @@ class QDQBertModelTester:
 
 @require_torch
 @require_pytorch_quantization
-class QDQBertModelTest(ModelTesterMixin, unittest.TestCase):
-
+class QDQBertModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (
         (
             QDQBertModel,
@@ -436,6 +436,19 @@ class QDQBertModelTest(ModelTesterMixin, unittest.TestCase):
         else ()
     )
     all_generative_model_classes = (QDQBertLMHeadModel,) if is_torch_available() else ()
+    pipeline_model_mapping = (
+        {
+            "feature-extraction": QDQBertModel,
+            "fill-mask": QDQBertForMaskedLM,
+            "question-answering": QDQBertForQuestionAnswering,
+            "text-classification": QDQBertForSequenceClassification,
+            "text-generation": QDQBertLMHeadModel,
+            "token-classification": QDQBertForTokenClassification,
+            "zero-shot": QDQBertForSequenceClassification,
+        }
+        if is_torch_available()
+        else {}
+    )
 
     def setUp(self):
         self.model_tester = QDQBertModelTester(self)

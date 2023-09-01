@@ -15,6 +15,8 @@
 """ TF 2.0 OPT model."""
 
 
+from __future__ import annotations
+
 from typing import Optional, Tuple, Union
 
 import numpy as np
@@ -25,7 +27,6 @@ from ...modeling_tf_outputs import TFBaseModelOutputWithPast, TFCausalLMOutputWi
 
 # Public API
 from ...modeling_tf_utils import (
-    DUMMY_INPUTS,
     TFCausalLanguageModelingLoss,
     TFModelInputType,
     TFPreTrainedModel,
@@ -33,7 +34,7 @@ from ...modeling_tf_utils import (
     keras_serializable,
     unpack_inputs,
 )
-from ...tf_utils import shape_list, stable_softmax
+from ...tf_utils import check_embeddings_within_bounds, shape_list, stable_softmax
 from ...utils import (
     add_code_sample_docstrings,
     add_start_docstrings,
@@ -48,13 +49,14 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "facebook/opt-350m"
 _CONFIG_FOR_DOC = "OPTConfig"
-_TOKENIZER_FOR_DOC = "GPT2Tokenizer"
 
 # Base model docstring
 _EXPECTED_OUTPUT_SHAPE = [1, 8, 1024]
 
 # Causal LM output
-_CAUSAL_LM_EXPECTED_OUTPUT = "Hey, are you consciours? Can you talk to me?\nI'm not consciours, but I can talk to you."
+_CAUSAL_LM_EXPECTED_OUTPUT = (
+    "Hey, are you conscious? Can you talk to me?\nI'm not conscious. I'm just a little bit of a weirdo."
+)
 
 LARGE_NEGATIVE = -1e8
 
@@ -153,12 +155,12 @@ class TFOPTAttention(tf.keras.layers.Layer):
     def call(
         self,
         hidden_states: tf.Tensor,
-        key_value_states: Optional[tf.Tensor] = None,
-        past_key_value: Optional[Tuple[Tuple[tf.Tensor]]] = None,
-        attention_mask: Optional[tf.Tensor] = None,
-        layer_head_mask: Optional[tf.Tensor] = None,
+        key_value_states: tf.Tensor | None = None,
+        past_key_value: Tuple[Tuple[tf.Tensor]] | None = None,
+        attention_mask: tf.Tensor | None = None,
+        layer_head_mask: tf.Tensor | None = None,
         training: Optional[bool] = False,
-    ) -> Tuple[tf.Tensor, Optional[tf.Tensor]]:
+    ) -> Tuple[tf.Tensor, tf.Tensor | None]:
         """Input shape: Batch x Time x Channel"""
 
         # if key_value_states are provided this layer is used as a cross-attention layer
@@ -292,8 +294,8 @@ class TFOPTDecoderLayer(tf.keras.layers.Layer):
     def call(
         self,
         hidden_states: tf.Tensor,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        layer_head_mask: Optional[tf.Tensor] = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        layer_head_mask: tf.Tensor | None = None,
         past_key_value: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
         training: Optional[bool] = False,
         output_attentions: Optional[bool] = False,
@@ -301,7 +303,7 @@ class TFOPTDecoderLayer(tf.keras.layers.Layer):
     ) -> Tuple[tf.Tensor, tf.Tensor, Tuple[Tuple[tf.Tensor]]]:
         """
         Args:
-            hidden_states (`tf.Tensor`): input to the layer of shape `(seq_len, batch, embed_dim)`
+            hidden_states (`tf.Tensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
             attention_mask (`tf.Tensor`, *optional*): attention mask of size
                 `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
             layer_head_mask (`tf.Tensor`, *optional*): mask for attention heads in a given layer of size
@@ -412,36 +414,13 @@ class TFOPTPreTrainedModel(TFPreTrainedModel):
     config_class = OPTConfig
     base_model_prefix = "model"
 
-    @property
-    def dummy_inputs(self):
-        pad_token = 1
-        input_ids = tf.cast(tf.convert_to_tensor(DUMMY_INPUTS), tf.int32)
-        dummy_inputs = {
-            "attention_mask": tf.math.not_equal(input_ids, pad_token),
-            "input_ids": input_ids,
-        }
-        return dummy_inputs
-
-    @tf.function(
-        input_signature=[
-            {
-                "input_ids": tf.TensorSpec((None, None), tf.int64, name="input_ids"),
-                "attention_mask": tf.TensorSpec((None, None), tf.int64, name="attention_mask"),
-            }
-        ]
-    )
-    def serving(self, inputs):
-        output = self.call(inputs)
-
-        return self.serving_output(output)
-
 
 OPT_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`tf.Tensor` of shape `({0})`):
             Indices of input sequence tokens in the vocabulary.
 
-            Indices can be obtained using [`BertTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
 
             [What are input IDs?](../glossary#input-ids)
@@ -487,7 +466,7 @@ OPT_INPUTS_DOCSTRING = r"""
 class TFOPTDecoder(tf.keras.layers.Layer):
     config_class = OPTConfig
 
-    def __init__(self, config: OPTConfig, load_weight_prefix=None, **kwargs):
+    def __init__(self, config: OPTConfig, **kwargs):
         super().__init__(**kwargs)
         self.config = config
         self.padding_idx = config.pad_token_id
@@ -553,10 +532,10 @@ class TFOPTDecoder(tf.keras.layers.Layer):
     @unpack_inputs
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        input_ids: TFModelInputType | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
         past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -570,7 +549,7 @@ class TFOPTDecoder(tf.keras.layers.Layer):
                 Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
                 provide it.
 
-                Indices can be obtained using [`OPTTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+                Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
                 [`PreTrainedTokenizer.__call__`] for details.
 
                 [What are input IDs?](../glossary#input-ids)
@@ -632,20 +611,20 @@ class TFOPTDecoder(tf.keras.layers.Layer):
         past_key_values_length = shape_list(past_key_values[0][0])[2] if past_key_values is not None else 0
 
         if inputs_embeds is None:
-            # Note: tf.gather, on which the embedding layer is based, won't check positive out of bound
-            # indices on GPU, returning zeros instead. This is a dangerous silent behavior.
-            tf.debugging.assert_less(
-                input_ids,
-                tf.cast(self.embed_tokens.vocab_size, dtype=input_ids.dtype),
-                message=(
-                    "input_ids must be smaller than the embedding layer's input dimension (got"
-                    f" {tf.math.reduce_max(input_ids)} >= {self.embed_tokens.vocab_size})"
-                ),
-            )
+            check_embeddings_within_bounds(input_ids, self.embed_tokens.vocab_size)
             inputs_embeds = self.embed_tokens(input_ids)
 
         if attention_mask is None:
             attention_mask = tf.ones(inputs_embeds.shape[:2], dtype=tf.bool)
+        else:
+            tf.debugging.assert_equal(
+                tf.shape(attention_mask)[1],
+                past_key_values_length + input_shape[1],
+                message=(
+                    f"The provided attention mask has length {attention_mask.shape[1]}, but its length should be "
+                    f"{past_key_values_length + input_shape[1]} (sum of the lengths of current and past inputs)"
+                ),
+            )
 
         pos_embeds = self.embed_positions(attention_mask, past_key_values_length)
 
@@ -733,19 +712,18 @@ class TFOPTMainLayer(tf.keras.layers.Layer):
     @unpack_inputs
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
         past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         training: Optional[bool] = False,
-        **kwargs
+        **kwargs,
     ) -> Union[TFBaseModelOutputWithPast, Tuple[tf.Tensor]]:
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -799,7 +777,6 @@ class TFOPTModel(TFOPTPreTrainedModel):
     @unpack_inputs
     @add_start_docstrings_to_model_forward(OPT_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFBaseModelOutputWithPast,
         config_class=_CONFIG_FOR_DOC,
@@ -807,19 +784,18 @@ class TFOPTModel(TFOPTPreTrainedModel):
     )
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        input_ids: TFModelInputType | None = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
         past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         training: Optional[bool] = False,
-        **kwargs
+        **kwargs,
     ) -> Union[TFBaseModelOutputWithPast, Tuple[tf.Tensor]]:
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -881,24 +857,23 @@ class TFOPTForCausalLM(TFOPTPreTrainedModel, TFCausalLanguageModelingLoss):
     def get_output_embeddings(self):
         return self.model.get_input_embeddings()
 
-    def prepare_inputs_for_generation(self, inputs, past=None, use_cache=None, **kwargs):
+    def prepare_inputs_for_generation(self, inputs, past_key_values=None, use_cache=None, **kwargs):
         attention_mask = kwargs.get("attention_mask", None)
 
         # only last token for inputs_ids if past is defined in kwargs
-        if past:
+        if past_key_values:
             inputs = tf.expand_dims(inputs[:, -1], -1)
 
         return {
             "input_ids": inputs,
             "attention_mask": attention_mask,
-            "past_key_values": past,
+            "past_key_values": past_key_values,
             "use_cache": use_cache,
         }
 
     @unpack_inputs
     @replace_return_docstrings(output_type=TFCausalLMOutputWithPast, config_class=_CONFIG_FOR_DOC)
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFCausalLMOutputWithPast,
         config_class=_CONFIG_FOR_DOC,
@@ -906,19 +881,19 @@ class TFOPTForCausalLM(TFOPTPreTrainedModel, TFCausalLanguageModelingLoss):
     )
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
+        input_ids: TFModelInputType | None = None,
         past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        labels: np.ndarray | tf.Tensor | None = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         training: Optional[bool] = False,
-        **kwargs
+        **kwargs,
     ) -> Union[TFCausalLMOutputWithPast, Tuple[tf.Tensor]]:
         r"""
         Args:
@@ -926,7 +901,7 @@ class TFOPTForCausalLM(TFOPTPreTrainedModel, TFCausalLanguageModelingLoss):
                 Indices of input sequence tokens in the vocabulary. Padding will be ignored by default should you
                 provide it.
 
-                Indices can be obtained using [`OPTTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+                Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
                 [`PreTrainedTokenizer.__call__`] for details.
 
                 [What are input IDs?](../glossary#input-ids)

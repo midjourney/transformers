@@ -85,7 +85,7 @@ LAYOUTXLM_ENCODE_KWARGS_DOCSTRING = r"""
                 argument defines the number of overlapping tokens.
             pad_to_multiple_of (`int`, *optional*):
                 If set will pad the sequence to a multiple of the provided value. This is especially useful to enable
-                the use of Tensor Cores on NVIDIA hardware with compute capability >= 7.5 (Volta).
+                the use of Tensor Cores on NVIDIA hardware with compute capability `>= 7.5` (Volta).
             return_tensors (`str` or [`~file_utils.TensorType`], *optional*):
                 If set, will return tensors instead of list of python integers. Acceptable values are:
 
@@ -233,7 +233,7 @@ class LayoutXLMTokenizerFast(PreTrainedTokenizerFast):
         pad_token_box=[0, 0, 0, 0],
         pad_token_label=-100,
         only_label_first_subword=True,
-        **kwargs
+        **kwargs,
     ):
         # Mask token behave like a normal word, i.e. include the space before it
         mask_token = AddedToken(mask_token, lstrip=True, rstrip=False) if isinstance(mask_token, str) else mask_token
@@ -257,7 +257,6 @@ class LayoutXLMTokenizerFast(PreTrainedTokenizerFast):
         )
 
         self.vocab_file = vocab_file
-        self.can_save_slow_tokenizer = False if not self.vocab_file else True
 
         # additional properties
         self.cls_token_box = cls_token_box
@@ -265,6 +264,10 @@ class LayoutXLMTokenizerFast(PreTrainedTokenizerFast):
         self.pad_token_box = pad_token_box
         self.pad_token_label = pad_token_label
         self.only_label_first_subword = only_label_first_subword
+
+    @property
+    def can_save_slow_tokenizer(self) -> bool:
+        return os.path.isfile(self.vocab_file) if self.vocab_file else False
 
     @add_end_docstrings(LAYOUTXLM_ENCODE_KWARGS_DOCSTRING)
     def __call__(
@@ -275,7 +278,7 @@ class LayoutXLMTokenizerFast(PreTrainedTokenizerFast):
         word_labels: Optional[Union[List[int], List[List[int]]]] = None,
         add_special_tokens: bool = True,
         padding: Union[bool, str, PaddingStrategy] = False,
-        truncation: Union[bool, str, TruncationStrategy] = False,
+        truncation: Union[bool, str, TruncationStrategy] = None,
         max_length: Optional[int] = None,
         stride: int = 0,
         pad_to_multiple_of: Optional[int] = None,
@@ -287,7 +290,7 @@ class LayoutXLMTokenizerFast(PreTrainedTokenizerFast):
         return_offsets_mapping: bool = False,
         return_length: bool = False,
         verbose: bool = True,
-        **kwargs
+        **kwargs,
     ) -> BatchEncoding:
         """
         Main method to tokenize and prepare for the model one or several sequence(s) or one or several pair(s) of
@@ -306,6 +309,7 @@ class LayoutXLMTokenizerFast(PreTrainedTokenizerFast):
             word_labels (`List[int]`, `List[List[int]]`, *optional*):
                 Word-level integer labels (for token classification tasks such as FUNSD, CORD).
         """
+
         # Input type checking for clearer error
         def _is_valid_text_input(t):
             if isinstance(t, str):
@@ -448,7 +452,6 @@ class LayoutXLMTokenizerFast(PreTrainedTokenizerFast):
         verbose: bool = True,
         **kwargs,
     ) -> BatchEncoding:
-
         if not isinstance(batch_text_or_text_pairs, list):
             raise TypeError(f"batch_text_or_text_pairs has to be a list (got {type(batch_text_or_text_pairs)})")
 
@@ -600,9 +603,8 @@ class LayoutXLMTokenizerFast(PreTrainedTokenizerFast):
         return_offsets_mapping: bool = False,
         return_length: bool = False,
         verbose: bool = True,
-        **kwargs
+        **kwargs,
     ) -> BatchEncoding:
-
         # make it a batched input
         # 2 options:
         # 1) only text, in case text must be a list of str
@@ -674,7 +676,7 @@ class LayoutXLMTokenizerFast(PreTrainedTokenizerFast):
                     - 'right': pads on the right of the sequences
             pad_to_multiple_of: (optional) Integer if set will pad the sequence to a multiple of the provided value.
                 This is especially useful to enable the use of Tensor Core on NVIDIA hardware with compute capability
-                >= 7.5 (Volta).
+                `>= 7.5` (Volta).
             return_attention_mask:
                 (optional) Set to False to avoid returning attention mask (default: set to model specifics)
         """

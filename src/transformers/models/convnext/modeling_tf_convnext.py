@@ -15,12 +15,12 @@
 """ TF 2.0 ConvNext model."""
 
 
-from typing import Dict, Optional, Tuple, Union
+from __future__ import annotations
+
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import tensorflow as tf
-
-from transformers import shape_list
 
 from ...activations_tf import get_tf_activation
 from ...modeling_tf_outputs import TFBaseModelOutput, TFBaseModelOutputWithPooling, TFSequenceClassifierOutput
@@ -32,6 +32,7 @@ from ...modeling_tf_utils import (
     keras_serializable,
     unpack_inputs,
 )
+from ...tf_utils import shape_list
 from ...utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from .configuration_convnext import ConvNextConfig
 
@@ -154,7 +155,7 @@ class TFConvNextLayer(tf.keras.layers.Layer):
             else tf.keras.layers.Activation("linear", name="drop_path")
         )
 
-    def build(self, input_shape: tf.TensorShape):
+    def build(self, input_shape: tf.TensorShape = None):
         # PT's `nn.Parameters` must be mapped to a TF layer weight to inherit the same name hierarchy (and vice-versa)
         self.layer_scale_parameter = (
             self.add_weight(
@@ -298,7 +299,7 @@ class TFConvNextMainLayer(tf.keras.layers.Layer):
     @unpack_inputs
     def call(
         self,
-        pixel_values: Optional[TFModelInputType] = None,
+        pixel_values: TFModelInputType | None = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         training: bool = False,
@@ -350,43 +351,6 @@ class TFConvNextPreTrainedModel(TFPreTrainedModel):
     base_model_prefix = "convnext"
     main_input_name = "pixel_values"
 
-    @property
-    def dummy_inputs(self) -> Dict[str, tf.Tensor]:
-        """
-        Dummy inputs to build the network.
-
-        Returns:
-            `Dict[str, tf.Tensor]`: The dummy inputs.
-        """
-        VISION_DUMMY_INPUTS = tf.random.uniform(
-            shape=(
-                3,
-                self.config.num_channels,
-                self.config.image_size,
-                self.config.image_size,
-            ),
-            dtype=tf.float32,
-        )
-        return {"pixel_values": tf.constant(VISION_DUMMY_INPUTS)}
-
-    @tf.function(
-        input_signature=[
-            {
-                "pixel_values": tf.TensorSpec((None, None, None, None), tf.float32, name="pixel_values"),
-            }
-        ]
-    )
-    def serving(self, inputs):
-        """
-        Method used for serving the model.
-
-        Args:
-            inputs (`Dict[str, tf.Tensor]`):
-                The input of the saved model as a dictionary of tensors.
-        """
-        output = self.call(inputs)
-        return self.serving_output(output)
-
 
 CONVNEXT_START_DOCSTRING = r"""
     This model inherits from [`TFPreTrainedModel`]. Check the superclass documentation for the generic methods the
@@ -432,8 +396,8 @@ CONVNEXT_START_DOCSTRING = r"""
 CONVNEXT_INPUTS_DOCSTRING = r"""
     Args:
         pixel_values (`np.ndarray`, `tf.Tensor`, `List[tf.Tensor]` ``Dict[str, tf.Tensor]` or `Dict[str, np.ndarray]` and each example must have the shape `(batch_size, num_channels, height, width)`):
-            Pixel values. Pixel values can be obtained using [`ConvNextFeatureExtractor`]. See
-            [`ConvNextFeatureExtractor.__call__`] for details.
+            Pixel values. Pixel values can be obtained using [`AutoImageProcessor`]. See
+            [`ConvNextImageProcessor.__call__`] for details.
 
         output_hidden_states (`bool`, *optional*):
             Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors for
@@ -459,7 +423,7 @@ class TFConvNextModel(TFConvNextPreTrainedModel):
     @replace_return_docstrings(output_type=TFBaseModelOutputWithPooling, config_class=_CONFIG_FOR_DOC)
     def call(
         self,
-        pixel_values: Optional[TFModelInputType] = None,
+        pixel_values: TFModelInputType | None = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         training: bool = False,
@@ -470,17 +434,17 @@ class TFConvNextModel(TFConvNextPreTrainedModel):
         Examples:
 
         ```python
-        >>> from transformers import ConvNextFeatureExtractor, TFConvNextModel
+        >>> from transformers import AutoImageProcessor, TFConvNextModel
         >>> from PIL import Image
         >>> import requests
 
         >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
         >>> image = Image.open(requests.get(url, stream=True).raw)
 
-        >>> feature_extractor = ConvNextFeatureExtractor.from_pretrained("facebook/convnext-tiny-224")
+        >>> image_processor = AutoImageProcessor.from_pretrained("facebook/convnext-tiny-224")
         >>> model = TFConvNextModel.from_pretrained("facebook/convnext-tiny-224")
 
-        >>> inputs = feature_extractor(images=image, return_tensors="tf")
+        >>> inputs = image_processor(images=image, return_tensors="tf")
         >>> outputs = model(**inputs)
         >>> last_hidden_states = outputs.last_hidden_state
         ```"""
@@ -506,14 +470,6 @@ class TFConvNextModel(TFConvNextPreTrainedModel):
             last_hidden_state=outputs.last_hidden_state,
             pooler_output=outputs.pooler_output,
             hidden_states=outputs.hidden_states,
-        )
-
-    def serving_output(self, output: TFBaseModelOutputWithPooling) -> TFBaseModelOutputWithPooling:
-        # hidden_states not converted to Tensor with tf.convert_to_tensor as they are all of different dimensions
-        return TFBaseModelOutputWithPooling(
-            last_hidden_state=output.last_hidden_state,
-            pooler_output=output.pooler_output,
-            hidden_states=output.hidden_states,
         )
 
 
@@ -544,10 +500,10 @@ class TFConvNextForImageClassification(TFConvNextPreTrainedModel, TFSequenceClas
     @replace_return_docstrings(output_type=TFSequenceClassifierOutput, config_class=_CONFIG_FOR_DOC)
     def call(
         self,
-        pixel_values: Optional[TFModelInputType] = None,
+        pixel_values: TFModelInputType | None = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        labels: np.ndarray | tf.Tensor | None = None,
         training: Optional[bool] = False,
     ) -> Union[TFSequenceClassifierOutput, Tuple[tf.Tensor]]:
         r"""
@@ -561,7 +517,7 @@ class TFConvNextForImageClassification(TFConvNextPreTrainedModel, TFSequenceClas
         Examples:
 
         ```python
-        >>> from transformers import ConvNextFeatureExtractor, TFConvNextForImageClassification
+        >>> from transformers import AutoImageProcessor, TFConvNextForImageClassification
         >>> import tensorflow as tf
         >>> from PIL import Image
         >>> import requests
@@ -569,10 +525,10 @@ class TFConvNextForImageClassification(TFConvNextPreTrainedModel, TFSequenceClas
         >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
         >>> image = Image.open(requests.get(url, stream=True).raw)
 
-        >>> feature_extractor = ConvNextFeatureExtractor.from_pretrained("facebook/convnext-tiny-224")
+        >>> image_processor = AutoImageProcessor.from_pretrained("facebook/convnext-tiny-224")
         >>> model = TFConvNextForImageClassification.from_pretrained("facebook/convnext-tiny-224")
 
-        >>> inputs = feature_extractor(images=image, return_tensors="tf")
+        >>> inputs = image_processor(images=image, return_tensors="tf")
         >>> outputs = model(**inputs)
         >>> logits = outputs.logits
         >>> # model predicts one of the 1000 ImageNet classes
@@ -608,7 +564,3 @@ class TFConvNextForImageClassification(TFConvNextPreTrainedModel, TFSequenceClas
             logits=logits,
             hidden_states=outputs.hidden_states,
         )
-
-    def serving_output(self, output: TFSequenceClassifierOutput) -> TFSequenceClassifierOutput:
-        # hidden_states not converted to Tensor with tf.convert_to_tensor as they are all of different dimensions
-        return TFSequenceClassifierOutput(logits=output.logits, hidden_states=output.hidden_states)

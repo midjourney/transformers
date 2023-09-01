@@ -425,7 +425,7 @@ class PreTrainedTokenizer(PreTrainedTokenizerBase):
                 if self.verbose:
                     logger.info(f"Adding {token} to the vocabulary")
 
-        added_tok_encoder = dict((tok, len(self) + i) for i, tok in enumerate(tokens_to_add))
+        added_tok_encoder = {tok: len(self) + i for i, tok in enumerate(tokens_to_add)}
         added_tok_decoder = {v: k for k, v in added_tok_encoder.items()}
         self.added_tokens_encoder.update(added_tok_encoder)
         self.added_tokens_decoder.update(added_tok_decoder)
@@ -495,9 +495,10 @@ class PreTrainedTokenizer(PreTrainedTokenizerBase):
             `List[str]`: The list of tokens.
         """
         # Simple mapping string => AddedToken for special tokens with specific tokenization behaviors
-        all_special_tokens_extended = dict(
-            (str(t), t) for t in self.all_special_tokens_extended if isinstance(t, AddedToken)
-        )
+        all_special_tokens_extended = {
+            str(t): t for t in self.all_special_tokens_extended if isinstance(t, AddedToken)
+        }
+        split_special_tokens = kwargs.pop("split_special_tokens", self.split_special_tokens)
 
         text, kwargs = self.prepare_for_tokenization(text, **kwargs)
 
@@ -513,8 +514,14 @@ class PreTrainedTokenizer(PreTrainedTokenizerBase):
             pattern = r"(" + r"|".join(escaped_special_toks) + r")|" + r"(.+?)"
             text = re.sub(pattern, lambda m: m.groups()[0] or m.groups()[1].lower(), text)
 
-        no_split_token = set(self.unique_no_split_tokens)
-        tokens = self.tokens_trie.split(text)
+        # split_special_tokens: empty `no_split_token`
+        if split_special_tokens:
+            no_split_token = []
+            tokens = [text]
+        else:
+            no_split_token = set(self.unique_no_split_tokens)
+            tokens = self.tokens_trie.split(text)
+
         # ["This is something", "<special_token_1>", "  else"]
         for i, token in enumerate(tokens):
             if token in no_split_token:
@@ -609,7 +616,7 @@ class PreTrainedTokenizer(PreTrainedTokenizerBase):
         return_offsets_mapping: bool = False,
         return_length: bool = False,
         verbose: bool = True,
-        **kwargs
+        **kwargs,
     ) -> BatchEncoding:
         def get_input_ids(text):
             if isinstance(text, str):
@@ -693,7 +700,7 @@ class PreTrainedTokenizer(PreTrainedTokenizerBase):
         return_offsets_mapping: bool = False,
         return_length: bool = False,
         verbose: bool = True,
-        **kwargs
+        **kwargs,
     ) -> BatchEncoding:
         def get_input_ids(text):
             if isinstance(text, str):
@@ -834,7 +841,7 @@ class PreTrainedTokenizer(PreTrainedTokenizerBase):
                 Whether or not the input is already pre-tokenized (e.g., split into words). If set to `True`, the
                 tokenizer assumes the input is already split into words (for instance, by splitting it on whitespace)
                 which it will tokenize. This is useful for NER or token classification.
-            kwargs:
+            kwargs (`Dict[str, Any]`, *optional*):
                 Keyword arguments to use for the tokenization.
 
         Returns:
@@ -922,9 +929,9 @@ class PreTrainedTokenizer(PreTrainedTokenizerBase):
         self,
         token_ids: List[int],
         skip_special_tokens: bool = False,
-        clean_up_tokenization_spaces: bool = True,
+        clean_up_tokenization_spaces: bool = None,
         spaces_between_special_tokens: bool = True,
-        **kwargs
+        **kwargs,
     ) -> str:
         self._decode_use_source_tokenizer = kwargs.pop("use_source_tokenizer", False)
 
@@ -953,6 +960,11 @@ class PreTrainedTokenizer(PreTrainedTokenizerBase):
         else:
             text = "".join(sub_texts)
 
+        clean_up_tokenization_spaces = (
+            clean_up_tokenization_spaces
+            if clean_up_tokenization_spaces is not None
+            else self.clean_up_tokenization_spaces
+        )
         if clean_up_tokenization_spaces:
             clean_text = self.clean_up_tokenization(text)
             return clean_text

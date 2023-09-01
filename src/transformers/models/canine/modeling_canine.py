@@ -37,7 +37,13 @@ from ...modeling_outputs import (
 )
 from ...modeling_utils import PreTrainedModel
 from ...pytorch_utils import apply_chunking_to_forward, find_pruneable_heads_and_indices, prune_linear_layer
-from ...utils import add_code_sample_docstrings, add_start_docstrings, add_start_docstrings_to_model_forward, logging
+from ...utils import (
+    add_code_sample_docstrings,
+    add_start_docstrings,
+    add_start_docstrings_to_model_forward,
+    logging,
+    replace_return_docstrings,
+)
 from .configuration_canine import CanineConfig
 
 
@@ -45,7 +51,6 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "google/canine-s"
 _CONFIG_FOR_DOC = "CanineConfig"
-_TOKENIZER_FOR_DOC = "CanineTokenizer"
 
 CANINE_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "google/canine-s",
@@ -211,7 +216,9 @@ class CanineEmbeddings(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
-        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
+        self.register_buffer(
+            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
+        )
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
 
     def _hash_bucket_tensors(self, input_ids, num_hashes: int, num_buckets: int):
@@ -307,7 +314,6 @@ class CharactersToMolecules(nn.Module):
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, char_encoding: torch.Tensor) -> torch.Tensor:
-
         # `cls_encoding`: [batch, 1, hidden_size]
         cls_encoding = char_encoding[:, 0:1, :]
 
@@ -896,7 +902,6 @@ class CaninePreTrainedModel(PreTrainedModel):
     load_tf_weights = load_tf_weights_in_canine
     base_model_prefix = "canine"
     supports_gradient_checkpointing = True
-    _keys_to_ignore_on_load_missing = [r"position_ids"]
 
     def _init_weights(self, module):
         """Initialize the weights"""
@@ -935,7 +940,7 @@ CANINE_INPUTS_DOCSTRING = r"""
         input_ids (`torch.LongTensor` of shape `({0})`):
             Indices of input sequence tokens in the vocabulary.
 
-            Indices can be obtained using [`CanineTokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
 
             [What are input IDs?](../glossary#input-ids)
@@ -1094,7 +1099,6 @@ class CanineModel(CaninePreTrainedModel):
 
     @add_start_docstrings_to_model_forward(CANINE_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=CanineModelOutputWithPooling,
         config_class=_CONFIG_FOR_DOC,
@@ -1122,6 +1126,7 @@ class CanineModel(CaninePreTrainedModel):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
+            self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
             input_shape = input_ids.size()
         elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
@@ -1276,7 +1281,6 @@ class CanineForSequenceClassification(CaninePreTrainedModel):
 
     @add_start_docstrings_to_model_forward(CANINE_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=SequenceClassifierOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -1373,7 +1377,6 @@ class CanineForMultipleChoice(CaninePreTrainedModel):
 
     @add_start_docstrings_to_model_forward(CANINE_INPUTS_DOCSTRING.format("batch_size, num_choices, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=MultipleChoiceModelOutput,
         config_class=_CONFIG_FOR_DOC,
@@ -1465,12 +1468,7 @@ class CanineForTokenClassification(CaninePreTrainedModel):
         self.post_init()
 
     @add_start_docstrings_to_model_forward(CANINE_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
-    @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
-        checkpoint=_CHECKPOINT_FOR_DOC,
-        output_type=TokenClassifierOutput,
-        config_class=_CONFIG_FOR_DOC,
-    )
+    @replace_return_docstrings(output_type=TokenClassifierOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
@@ -1487,7 +1485,39 @@ class CanineForTokenClassification(CaninePreTrainedModel):
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the token classification loss. Indices should be in `[0, ..., config.num_labels - 1]`.
-        """
+
+        Returns:
+
+        Example:
+
+        ```python
+        >>> from transformers import AutoTokenizer, CanineForTokenClassification
+        >>> import torch
+
+        >>> tokenizer = AutoTokenizer.from_pretrained("google/canine-s")
+        >>> model = CanineForTokenClassification.from_pretrained("google/canine-s")
+
+        >>> inputs = tokenizer(
+        ...     "HuggingFace is a company based in Paris and New York", add_special_tokens=False, return_tensors="pt"
+        ... )
+
+        >>> with torch.no_grad():
+        ...     logits = model(**inputs).logits
+
+        >>> predicted_token_class_ids = logits.argmax(-1)
+
+        >>> # Note that tokens are classified rather then input words which means that
+        >>> # there might be more predicted token classes than words.
+        >>> # Multiple token classes might account for the same word
+        >>> predicted_tokens_classes = [model.config.id2label[t.item()] for t in predicted_token_class_ids[0]]
+        >>> predicted_tokens_classes  # doctest: +SKIP
+        ```
+
+        ```python
+        >>> labels = predicted_token_class_ids
+        >>> loss = model(**inputs, labels=labels).loss
+        >>> round(loss.item(), 2)  # doctest: +SKIP
+        ```"""
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         outputs = self.canine(
@@ -1544,10 +1574,11 @@ class CanineForQuestionAnswering(CaninePreTrainedModel):
 
     @add_start_docstrings_to_model_forward(CANINE_INPUTS_DOCSTRING.format("batch_size, sequence_length"))
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
-        checkpoint=_CHECKPOINT_FOR_DOC,
+        checkpoint="Splend1dchan/canine-c-squad",
         output_type=QuestionAnsweringModelOutput,
         config_class=_CONFIG_FOR_DOC,
+        expected_output="'nice puppet'",
+        expected_loss=8.81,
     )
     def forward(
         self,

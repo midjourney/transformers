@@ -20,14 +20,18 @@ import os
 import tempfile
 import unittest
 
+import numpy as np
+
+import transformers
 from transformers import WhisperConfig
-from transformers.testing_utils import is_torch_available, require_torch, require_torchaudio, slow, torch_device
-from transformers.utils import cached_property
+from transformers.testing_utils import is_pt_flax_cross_test, require_torch, require_torchaudio, slow, torch_device
+from transformers.utils import cached_property, is_flax_available, is_torch_available
 from transformers.utils.import_utils import is_datasets_available
 
-from ...generation.test_generation_utils import GenerationTesterMixin
+from ...generation.test_utils import GenerationTesterMixin
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import ModelTesterMixin, _config_zero_init, floats_tensor, ids_tensor
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_datasets_available():
@@ -39,12 +43,21 @@ if is_torch_available():
 
     from transformers import (
         WhisperFeatureExtractor,
+        WhisperForAudioClassification,
         WhisperForConditionalGeneration,
         WhisperModel,
         WhisperProcessor,
         set_seed,
     )
     from transformers.models.whisper.modeling_whisper import WhisperDecoder, WhisperEncoder
+
+if is_flax_available():
+    import jax.numpy as jnp
+
+    from transformers.modeling_flax_pytorch_utils import (
+        convert_pytorch_state_dict_to_flax,
+        load_flax_weights_in_pytorch_model,
+    )
 
 
 def prepare_whisper_inputs_dict(
@@ -81,11 +94,11 @@ class WhisperModelTester:
     def __init__(
         self,
         parent,
-        batch_size=13,
+        batch_size=2,
         seq_length=60,
         is_training=True,
         use_labels=False,
-        vocab_size=99,
+        vocab_size=200,
         hidden_size=16,
         num_hidden_layers=2,
         num_attention_heads=4,
@@ -182,8 +195,11 @@ class WhisperModelTester:
 
         return input_lengths
 
-    def create_and_check_model_forward(self, config, inputs_dict):
+    def create_and_check_model_forward(self, config, inputs_dict, freeze_encoder=False):
         model = WhisperModel(config=config).to(torch_device).eval()
+
+        if freeze_encoder:
+            model.freeze_encoder()
 
         input_features = inputs_dict["input_features"]
         decoder_input_ids = inputs_dict["decoder_input_ids"]
@@ -257,15 +273,41 @@ class WhisperModelTester:
 
 
 @require_torch
-class WhisperModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
+class WhisperModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (WhisperModel, WhisperForConditionalGeneration) if is_torch_available() else ()
     all_generative_model_classes = (WhisperForConditionalGeneration,) if is_torch_available() else ()
+    pipeline_model_mapping = (
+        {
+            "audio-classification": WhisperForAudioClassification,
+            "automatic-speech-recognition": WhisperForConditionalGeneration,
+            "feature-extraction": WhisperModel,
+        }
+        if is_torch_available()
+        else {}
+    )
     is_encoder_decoder = True
     fx_compatible = False
     test_pruning = False
     test_missing_keys = False
+    # Needs higher percentages after model tester's vocab_size is changed to 200 (PR #21222)
+    # `0.5` is for `test_disk_offload` (which also works for `test_model_parallelism`)
+    model_split_percents = [0.5, 0.8, 0.9]
 
     input_name = "input_features"
+
+    # TODO: Fix the failed tests
+    def is_pipeline_test_to_skip(
+        self, pipeline_test_casse_name, config_class, model_architecture, tokenizer_name, processor_name
+    ):
+        if pipeline_test_casse_name in [
+            "AutomaticSpeechRecognitionPipelineTests",
+            "AudioClassificationPipelineTests",
+        ]:
+            # RuntimeError: The size of tensor a (1500) must match the size of tensor b (30) at non-singleton
+            # dimension 1
+            return True
+
+        return False
 
     def setUp(self):
         self.model_tester = WhisperModelTester(self)
@@ -289,6 +331,26 @@ class WhisperModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCas
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_model_forward(*config_and_inputs)
 
+    def test_model_forward_with_frozen_encoder(self):
+        config_and_inputs = self.model_tester.prepare_config_and_inputs()
+        self.model_tester.create_and_check_model_forward(*config_and_inputs, freeze_encoder=True)
+
+    def test_requires_grad_with_frozen_encoder(self):
+        config = self.model_tester.get_config()
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            model.freeze_encoder()
+
+            try:
+                encoder_grads = [param.requires_grad for param in model.encoder.parameters()]
+                decoder_grads = [param.requires_grad for param in model.decoder.parameters()]
+            except AttributeError:
+                encoder_grads = [param.requires_grad for param in model.model.encoder.parameters()]
+                decoder_grads = [param.requires_grad for param in model.model.decoder.parameters()]
+
+            self.assertFalse(all(encoder_grads))
+            self.assertTrue(all(decoder_grads))
+
     def test_decoder_model_past_with_large_inputs(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_decoder_model_past_large_inputs(*config_and_inputs)
@@ -297,25 +359,39 @@ class WhisperModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCas
         config_and_inputs = self.model_tester.prepare_config_and_inputs_for_common()
         self.model_tester.check_encoder_decoder_model_standalone(*config_and_inputs)
 
-    def _get_input_ids_and_config(self):
+    def _get_input_ids_and_config(self, batch_size=3):
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
         input_ids = inputs_dict[self.input_name]
 
-        # cut to half length & take max batch_size 3
-        max_batch_size = 3
-        input_ids = input_ids[:max_batch_size, :, :]
+        # cut to half length & take max batch_size=batch_size
+        input_ids = input_ids[:batch_size, :, :]
 
         # generate max 3 tokens
-        max_length = input_ids.shape[-1] + 3
+        max_length = 4
         if config.eos_token_id is not None and config.pad_token_id is None:
             # hack to allow generate for models such as GPT2 as is done in `generate()`
             config.pad_token_id = config.eos_token_id
 
         return config, input_ids, None, max_length
 
-    # not implemented currently
     def test_inputs_embeds(self):
-        pass
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            model.to(torch_device)
+            model.eval()
+
+            inputs = copy.deepcopy(self._prepare_for_class(inputs_dict, model_class))
+
+            decoder_input_ids = inputs.pop("decoder_input_ids", None)
+            inputs.pop("decoder_attention_mask", None)
+
+            wte = model.get_input_embeddings()
+            inputs["decoder_inputs_embeds"] = wte(decoder_input_ids)
+
+            with torch.no_grad():
+                model(**inputs)[0]
 
     # training is not supported yet
     def test_training(self):
@@ -338,6 +414,21 @@ class WhisperModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCas
         model.generate(input_features)
         model.generate(input_features, num_beams=4, do_sample=True, early_stopping=False, num_return_sequences=3)
 
+    def test_generate_language(self):
+        config, input_dict = self.model_tester.prepare_config_and_inputs()
+        input_features = input_dict["input_features"]
+        model = WhisperForConditionalGeneration(config).to(torch_device)
+        # Hack to keep the test fast and not require downloading a model with a generation_config
+        model.generation_config.__setattr__("lang_to_id", {"<|en|>": 1})
+        model.generation_config.__setattr__("task_to_id", {"transcribe": 2})
+
+        # test language code
+        model.generate(input_features, language="en")
+        # test tokenizer code
+        model.generate(input_features, language="<|en|>")
+        # test language name
+        model.generate(input_features, language="English")
+
     def test_forward_signature(self):
         config, _ = self.model_tester.prepare_config_and_inputs_for_common()
 
@@ -349,6 +440,7 @@ class WhisperModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCas
 
             expected_arg_names = [
                 "input_features",
+                "attention_mask",
                 "decoder_input_ids",
                 "decoder_attention_mask",
             ]
@@ -686,7 +778,17 @@ class WhisperModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCas
                 input_features = inputs["input_features"]
                 decoder_input_ids = inputs["decoder_input_ids"]
                 decoder_attention_mask = inputs["decoder_attention_mask"]
-                traced_model = torch.jit.trace(model, (input_features, decoder_input_ids, decoder_attention_mask))
+                # prepare `attention_mask` with shape (batch_size, sequence_length)
+                attention_mask = torch.ones(
+                    input_features.shape[0],
+                    input_features.shape[-1],
+                    device=input_features.device,
+                    dtype=input_features.dtype,
+                )
+                traced_model = torch.jit.trace(
+                    model, (input_features, attention_mask, decoder_input_ids, decoder_attention_mask)
+                )
+
             except RuntimeError:
                 self.fail("Couldn't trace module.")
 
@@ -712,7 +814,27 @@ class WhisperModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCas
             model_state_dict = model.state_dict()
             loaded_model_state_dict = loaded_model.state_dict()
 
+            non_persistent_buffers = {}
+            for key in loaded_model_state_dict.keys():
+                if key not in model_state_dict.keys():
+                    non_persistent_buffers[key] = loaded_model_state_dict[key]
+
+            loaded_model_state_dict = {
+                key: value for key, value in loaded_model_state_dict.items() if key not in non_persistent_buffers
+            }
+
             self.assertEqual(set(model_state_dict.keys()), set(loaded_model_state_dict.keys()))
+
+            model_buffers = list(model.buffers())
+            for non_persistent_buffer in non_persistent_buffers.values():
+                found_buffer = False
+                for i, model_buffer in enumerate(model_buffers):
+                    if torch.equal(non_persistent_buffer, model_buffer):
+                        found_buffer = True
+                        break
+
+                self.assertTrue(found_buffer)
+                model_buffers.pop(i)
 
             models_equal = True
             for layer_name, p1 in model_state_dict.items():
@@ -721,6 +843,237 @@ class WhisperModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCas
                     models_equal = False
 
             self.assertTrue(models_equal)
+
+    def check_pt_tf_outputs(self, tf_outputs, pt_outputs, model_class, tol=5e-5, name="outputs", attributes=None):
+        # We override with a slightly higher tol value, as test recently became flaky
+        super().check_pt_tf_outputs(tf_outputs, pt_outputs, model_class, tol, name, attributes)
+
+    def check_pt_flax_outputs(self, fx_outputs, pt_outputs, model_class, tol=5e-5, name="outputs", attributes=None):
+        # We override with a slightly higher tol value, as test recently became flaky
+        super().check_pt_flax_outputs(fx_outputs, pt_outputs, model_class, tol, name, attributes)
+
+    @is_pt_flax_cross_test
+    def test_equivalence_pt_to_flax(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        init_shape = (1,) + inputs_dict["input_features"].shape[1:]
+
+        for model_class in self.all_model_classes:
+            with self.subTest(model_class.__name__):
+                fx_model_class_name = "Flax" + model_class.__name__
+
+                if not hasattr(transformers, fx_model_class_name):
+                    # no flax model exists for this class
+                    return
+
+                # Output all for aggressive testing
+                config.output_hidden_states = True
+                config.output_attentions = self.has_attentions
+
+                fx_model_class = getattr(transformers, fx_model_class_name)
+
+                # load PyTorch class
+                pt_model = model_class(config).eval()
+                # Flax models don't use the `use_cache` option and cache is not returned as a default.
+                # So we disable `use_cache` here for PyTorch model.
+                pt_model.config.use_cache = False
+
+                # load Flax class
+                fx_model = fx_model_class(config, input_shape=init_shape, dtype=jnp.float32)
+
+                # make sure only flax inputs are forward that actually exist in function args
+                fx_input_keys = inspect.signature(fx_model.__call__).parameters.keys()
+
+                # prepare inputs
+                pt_inputs = self._prepare_for_class(inputs_dict, model_class)
+
+                # remove function args that don't exist in Flax
+                pt_inputs = {k: v for k, v in pt_inputs.items() if k in fx_input_keys}
+
+                # send pytorch inputs to the correct device
+                pt_inputs = {
+                    k: v.to(device=torch_device) if isinstance(v, torch.Tensor) else v for k, v in pt_inputs.items()
+                }
+
+                # convert inputs to Flax
+                fx_inputs = {k: np.array(v.to("cpu")) for k, v in pt_inputs.items() if torch.is_tensor(v)}
+
+                fx_state = convert_pytorch_state_dict_to_flax(pt_model.state_dict(), fx_model)
+                fx_model.params = fx_state
+
+                # send pytorch model to the correct device
+                pt_model.to(torch_device)
+
+                with torch.no_grad():
+                    pt_outputs = pt_model(**pt_inputs)
+                fx_outputs = fx_model(**fx_inputs)
+
+                fx_keys = tuple([k for k, v in fx_outputs.items() if v is not None])
+                pt_keys = tuple([k for k, v in pt_outputs.items() if v is not None])
+
+                self.assertEqual(fx_keys, pt_keys)
+                self.check_pt_flax_outputs(fx_outputs, pt_outputs, model_class)
+
+                with tempfile.TemporaryDirectory() as tmpdirname:
+                    pt_model.save_pretrained(tmpdirname)
+                    fx_model_loaded = fx_model_class.from_pretrained(tmpdirname, input_shape=init_shape, from_pt=True)
+
+                fx_outputs_loaded = fx_model_loaded(**fx_inputs)
+
+                fx_keys = tuple([k for k, v in fx_outputs_loaded.items() if v is not None])
+                pt_keys = tuple([k for k, v in pt_outputs.items() if v is not None])
+
+                self.assertEqual(fx_keys, pt_keys)
+                self.check_pt_flax_outputs(fx_outputs_loaded, pt_outputs, model_class)
+
+    @is_pt_flax_cross_test
+    def test_equivalence_flax_to_pt(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        init_shape = (1,) + inputs_dict["input_features"].shape[1:]
+
+        for model_class in self.all_model_classes:
+            with self.subTest(model_class.__name__):
+                fx_model_class_name = "Flax" + model_class.__name__
+
+                if not hasattr(transformers, fx_model_class_name):
+                    # no flax model exists for this class
+                    return
+
+                # Output all for aggressive testing
+                config.output_hidden_states = True
+                config.output_attentions = self.has_attentions
+
+                fx_model_class = getattr(transformers, fx_model_class_name)
+
+                # load PyTorch class
+                pt_model = model_class(config).eval()
+                # Flax models don't use the `use_cache` option and cache is not returned as a default.
+                # So we disable `use_cache` here for PyTorch model.
+                pt_model.config.use_cache = False
+
+                # load Flax class
+                fx_model = fx_model_class(config, input_shape=init_shape, dtype=jnp.float32)
+
+                # make sure only flax inputs are forward that actually exist in function args
+                fx_input_keys = inspect.signature(fx_model.__call__).parameters.keys()
+
+                # prepare inputs
+                pt_inputs = self._prepare_for_class(inputs_dict, model_class)
+
+                # remove function args that don't exist in Flax
+                pt_inputs = {k: v for k, v in pt_inputs.items() if k in fx_input_keys}
+
+                # send pytorch inputs to the correct device
+                pt_inputs = {
+                    k: v.to(device=torch_device) if isinstance(v, torch.Tensor) else v for k, v in pt_inputs.items()
+                }
+
+                # convert inputs to Flax
+                fx_inputs = {k: np.array(v.to("cpu")) for k, v in pt_inputs.items() if torch.is_tensor(v)}
+
+                pt_model = load_flax_weights_in_pytorch_model(pt_model, fx_model.params)
+
+                # make sure weights are tied in PyTorch
+                pt_model.tie_weights()
+
+                # send pytorch model to the correct device
+                pt_model.to(torch_device)
+
+                with torch.no_grad():
+                    pt_outputs = pt_model(**pt_inputs)
+                fx_outputs = fx_model(**fx_inputs)
+
+                fx_keys = tuple([k for k, v in fx_outputs.items() if v is not None])
+                pt_keys = tuple([k for k, v in pt_outputs.items() if v is not None])
+
+                self.assertEqual(fx_keys, pt_keys)
+                self.check_pt_flax_outputs(fx_outputs, pt_outputs, model_class)
+
+                with tempfile.TemporaryDirectory() as tmpdirname:
+                    fx_model.save_pretrained(tmpdirname)
+                    pt_model_loaded = model_class.from_pretrained(tmpdirname, from_flax=True)
+
+                # send pytorch model to the correct device
+                pt_model_loaded.to(torch_device)
+                pt_model_loaded.eval()
+
+                with torch.no_grad():
+                    pt_outputs_loaded = pt_model_loaded(**pt_inputs)
+
+                fx_keys = tuple([k for k, v in fx_outputs.items() if v is not None])
+                pt_keys = tuple([k for k, v in pt_outputs_loaded.items() if v is not None])
+
+                self.assertEqual(fx_keys, pt_keys)
+                self.check_pt_flax_outputs(fx_outputs, pt_outputs_loaded, model_class)
+
+    def test_mask_feature_prob(self):
+        config, input_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        config.mask_feature_prob = 0.2
+        config.mask_feature_length = 2
+
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            model.to(torch_device)
+            model.train()
+
+            # forward pass
+            encoder_last_hidden_state = model(**input_dict).encoder_last_hidden_state
+            self.assertTrue(encoder_last_hidden_state.shape, (13, 30, 16))
+
+    def test_mask_time_prob(self):
+        config, input_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        config.mask_time_prob = 0.2
+        config.mask_time_length = 2
+
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            model.to(torch_device)
+            model.train()
+
+            # forward pass
+            encoder_last_hidden_state = model(**input_dict).encoder_last_hidden_state
+            self.assertTrue(encoder_last_hidden_state.shape, (13, 30, 16))
+
+    def test_generate_with_prompt_ids_and_task_and_language(self):
+        config, input_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        model = WhisperForConditionalGeneration(config).eval().to(torch_device)
+        input_features = input_dict["input_features"]
+        prompt_ids = np.arange(5)
+        language = "<|de|>"
+        task = "translate"
+        lang_id = 6
+        task_id = 7
+        model.generation_config.__setattr__("lang_to_id", {language: lang_id})
+        model.generation_config.__setattr__("task_to_id", {task: task_id})
+
+        output = model.generate(input_features, max_new_tokens=5, task=task, language=language, prompt_ids=prompt_ids)
+
+        expected_output_start = [
+            *prompt_ids.tolist(),
+            model.generation_config.decoder_start_token_id,
+            lang_id,
+            task_id,
+        ]
+        for row in output.tolist():
+            self.assertListEqual(row[: len(expected_output_start)], expected_output_start)
+
+    def test_generate_with_prompt_ids_and_forced_decoder_ids(self):
+        config, input_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        model = WhisperForConditionalGeneration(config).eval().to(torch_device)
+        input_features = input_dict["input_features"]
+        prompt_ids = np.asarray(range(5))
+        forced_decoder_ids = [(1, 6), (2, 7), (3, 8)]
+
+        output = model.generate(
+            input_features, max_new_tokens=5, forced_decoder_ids=forced_decoder_ids, prompt_ids=prompt_ids
+        )
+
+        expected_output_start = [
+            *prompt_ids.tolist(),
+            model.generation_config.decoder_start_token_id,
+            *[token for _rank, token in forced_decoder_ids],
+        ]
+        for row in output.tolist():
+            self.assertListEqual(row[: len(expected_output_start)], expected_output_start)
 
 
 @require_torch
@@ -731,7 +1084,6 @@ class WhisperModelIntegrationTests(unittest.TestCase):
         return WhisperProcessor.from_pretrained("openai/whisper-base")
 
     def _load_datasamples(self, num_samples):
-
         ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
         # automatic decoding with librispeech
         speech_samples = ds.sort("id").select(range(num_samples))[:num_samples]["audio"]
@@ -830,13 +1182,15 @@ class WhisperModelIntegrationTests(unittest.TestCase):
         input_speech = self._load_datasamples(1)
 
         processor = WhisperProcessor.from_pretrained("openai/whisper-large")
-        processed_inputs = processor(audio=input_speech, text="This part of the speech", return_tensors="pt")
+        processed_inputs = processor(
+            audio=input_speech, text="This part of the speech", add_special_tokens=False, return_tensors="pt"
+        )
         input_features = processed_inputs.input_features.to(torch_device)
-        labels = processed_inputs.labels.to(torch_device)
+        decoder_input_ids = processed_inputs.labels.to(torch_device)
 
         logits = model(
             input_features,
-            decoder_input_ids=labels,
+            decoder_input_ids=decoder_input_ids,
             output_hidden_states=False,
             output_attentions=False,
             use_cache=False,
@@ -859,7 +1213,6 @@ class WhisperModelIntegrationTests(unittest.TestCase):
 
     @slow
     def test_tiny_en_generation(self):
-
         torch_device = "cpu"
         set_seed(0)
         processor = WhisperProcessor.from_pretrained("openai/whisper-tiny.en")
@@ -872,7 +1225,7 @@ class WhisperModelIntegrationTests(unittest.TestCase):
             torch_device
         )
 
-        generated_ids = model.generate(input_features, num_beams=5)
+        generated_ids = model.generate(input_features, num_beams=5, max_length=20)
         transcript = processor.tokenizer.batch_decode(generated_ids)[0]
 
         EXPECTED_TRANSCRIPT = (
@@ -883,7 +1236,6 @@ class WhisperModelIntegrationTests(unittest.TestCase):
 
     @slow
     def test_tiny_generation(self):
-
         torch_device = "cpu"
         set_seed(0)
         processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
@@ -895,7 +1247,7 @@ class WhisperModelIntegrationTests(unittest.TestCase):
             torch_device
         )
 
-        generated_ids = model.generate(input_features, num_beams=5)
+        generated_ids = model.generate(input_features, num_beams=5, max_length=20)
         transcript = processor.tokenizer.decode(generated_ids[0])
 
         EXPECTED_TRANSCRIPT = (
@@ -917,10 +1269,8 @@ class WhisperModelIntegrationTests(unittest.TestCase):
             torch_device
         )
 
-        model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language="en", task="transcribe")
         generated_ids = model.generate(
-            input_features,
-            do_sample=False,
+            input_features, do_sample=False, max_length=20, language="<|en|>", task="transcribe"
         )
         transcript = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
@@ -942,25 +1292,25 @@ class WhisperModelIntegrationTests(unittest.TestCase):
             torch_device
         )
 
-        model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language="ja", task="transcribe")
-        generated_ids = model.generate(input_features, do_sample=False)
+        generated_ids = model.generate(
+            input_features, do_sample=False, max_length=20, language="<|ja|>", task="transcribe"
+        )
         transcript = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
         EXPECTED_TRANSCRIPT = "木村さんに電話を貸してもらいました"
         self.assertEqual(transcript, EXPECTED_TRANSCRIPT)
 
-        model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language="en", task="transcribe")
         generated_ids = model.generate(
-            input_features,
-            do_sample=False,
+            input_features, do_sample=False, max_length=20, language="<|en|>", task="transcribe"
         )
         transcript = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
-        EXPECTED_TRANSCRIPT = " Kimura san ni denwa wo kaite moraimashita"
+        EXPECTED_TRANSCRIPT = " Kimura-san called me."
         self.assertEqual(transcript, EXPECTED_TRANSCRIPT)
 
-        model.config.forced_decoder_ids = processor.get_decoder_prompt_ids(language="ja", task="translate")
-        generated_ids = model.generate(input_features, do_sample=False)
+        generated_ids = model.generate(
+            input_features, do_sample=False, max_length=20, language="<|ja|>", task="translate"
+        )
         transcript = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
 
         EXPECTED_TRANSCRIPT = " I borrowed a phone from Kimura san"
@@ -974,15 +1324,15 @@ class WhisperModelIntegrationTests(unittest.TestCase):
 
         input_speech = self._load_datasamples(4)
         input_features = processor.feature_extractor(raw_speech=input_speech, return_tensors="pt").input_features
-        generated_ids = model.generate(input_features)
+        generated_ids = model.generate(input_features, max_length=20, task="translate")
 
         # fmt: off
         EXPECTED_LOGITS = torch.tensor(
             [
-                [50258, 50358, 50363, 2221, 13, 2326, 388, 391, 307, 264, 50244, 295, 264, 2808, 5359, 293, 321, 366, 5404, 281],
-                [50258, 50358, 50363, 6966, 307, 2221, 13, 2326, 388, 391, 311, 9060, 1570, 1880, 813, 702, 1871, 13, 50257, 50257],
-                [50258, 50358, 50363, 634, 5112, 505, 300, 412, 341, 42729, 3196, 295, 264, 1064, 11, 365, 5272, 293, 12904, 9256],
-                [50258, 50358, 50363, 634, 575, 12525, 22618, 1968, 6144, 35617, 20084, 1756, 311, 589, 307, 534, 10281, 934, 439, 11]
+                [50258, 50259, 50358, 50363, 2221, 13, 2326, 388, 391, 307, 264, 50244, 295, 264, 2808, 5359, 293, 321, 366, 5404],
+                [50258, 50259, 50358, 50363, 6966, 307, 2221, 13, 2326, 388, 391, 311, 9060, 1570, 1880, 813, 702, 1871, 13, 50257],
+                [50258, 50259, 50358, 50363, 634, 5112, 505, 300, 412, 341, 42729, 3196, 295, 264, 1064, 11, 365, 5272, 293, 12904],
+                [50258, 50259, 50358, 50363, 634, 575, 12525, 22618, 1968, 6144, 35617, 20084, 1756, 311, 589, 307, 534, 10281, 934, 439]
             ]
         )
         # fmt: on
@@ -991,10 +1341,10 @@ class WhisperModelIntegrationTests(unittest.TestCase):
 
         # fmt: off
         EXPECTED_TRANSCRIPT = [
-            ' Mr. Quilter is the apostle of the middle classes, and we are glad to',
+            " Mr. Quilter is the apostle of the middle classes and we are glad",
             " Nor is Mr. Quilter's manner less interesting than his matter.",
-            " He tells us that at this festive season of the year, with Christmas and roast beef",
-            " He has grave doubts whether Sir Frederick Layton's work is really Greek after all,"
+            " He tells us that at this festive season of the year, with Christmas and roast",
+            " He has grave doubts whether Sir Frederick Layton's work is really Greek after all",
         ]
         # fmt: on
 
@@ -1003,7 +1353,6 @@ class WhisperModelIntegrationTests(unittest.TestCase):
 
     @slow
     def test_tiny_en_batched_generation(self):
-        torch_device = "cuda"
         set_seed(0)
         processor = WhisperProcessor.from_pretrained("openai/whisper-tiny.en")
         model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny.en")
@@ -1013,7 +1362,7 @@ class WhisperModelIntegrationTests(unittest.TestCase):
         input_features = processor.feature_extractor(raw_speech=input_speech, return_tensors="pt").input_features.to(
             torch_device
         )
-        generated_ids = model.generate(input_features).to("cpu")
+        generated_ids = model.generate(input_features, max_length=20).to("cpu")
 
         # fmt: off
         EXPECTED_LOGITS = torch.tensor(
@@ -1040,3 +1389,548 @@ class WhisperModelIntegrationTests(unittest.TestCase):
 
         transcript = processor.batch_decode(generated_ids, skip_special_tokens=True)
         self.assertListEqual(transcript, EXPECTED_TRANSCRIPT)
+
+    @slow
+    def test_tiny_timestamp_generation(self):
+        set_seed(0)
+        processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
+        model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
+        model.to(torch_device)
+
+        input_speech = np.concatenate(self._load_datasamples(4))
+        input_features = processor.feature_extractor(raw_speech=input_speech, return_tensors="pt").input_features.to(
+            torch_device
+        )
+
+        generated_ids = model.generate(input_features, max_length=448, return_timestamps=True).to("cpu")
+
+        # fmt: off
+        EXPECTED_OUTPUT = torch.tensor([50258, 50259, 50359, 50364, 2221, 13, 2326, 388, 391, 307, 264, 50244, 295, 264, 2808, 5359, 11, 293, 321, 366, 5404, 281, 2928, 702, 14943, 13, 50692, 50692, 6966, 307, 2221, 13, 2326, 388, 391, 311, 9060, 1570, 1880, 813, 702, 1871, 13, 50926, 50926, 634, 5112, 505, 300, 412, 341, 42729, 3196, 295, 264, 1064, 11, 365, 5272, 293, 12904, 9256, 450, 10539, 51208, 51208, 949, 505, 11, 14138, 10117, 490, 3936, 293, 1080, 3542, 5160, 881, 26336, 281, 264, 1575, 13, 51552, 51552, 634, 575, 12525, 22618, 1968, 6144, 35617, 7354, 1292, 6, 589, 307, 534, 10281, 934, 439, 11, 293, 51836, 51836, 50257])
+        # fmt: on
+
+        self.assertTrue(torch.allclose(generated_ids, EXPECTED_OUTPUT))
+
+        EXPECTED_TRANSCRIPT = [
+            {
+                "text": (
+                    " Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel. Nor is"
+                    " Mr. Quilter's manner less interesting than his matter. He tells us that at this festive season"
+                    " of the year, with Christmas and roast beef looming before us, similarly drawn from eating and"
+                    " its results occur most readily to the mind. He has grave doubts whether Sir Frederick Latins'"
+                    " work is really Greek after all, and"
+                ),
+                "offsets": [
+                    {
+                        "text": (
+                            " Mr. Quilter is the apostle of the middle classes, and we are glad to welcome his gospel."
+                        ),
+                        "timestamp": (0.0, 6.5600000000000005),
+                    },
+                    {
+                        "text": " Nor is Mr. Quilter's manner less interesting than his matter.",
+                        "timestamp": (6.5600000000000005, 11.24),
+                    },
+                    {
+                        "text": (
+                            " He tells us that at this festive season of the year, with Christmas and roast beef"
+                            " looming"
+                        ),
+                        "timestamp": (11.24, 16.88),
+                    },
+                    {
+                        "text": (
+                            " before us, similarly drawn from eating and its results occur most readily to the mind."
+                        ),
+                        "timestamp": (16.88, 23.76),
+                    },
+                    {
+                        "text": (
+                            " He has grave doubts whether Sir Frederick Latins' work is really Greek after all, and"
+                        ),
+                        "timestamp": (23.76, 29.44),
+                    },
+                ],
+            }
+        ]
+
+        transcript = processor.batch_decode(generated_ids, skip_special_tokens=True, output_offsets=True)
+        self.assertEqual(transcript, EXPECTED_TRANSCRIPT)
+
+    @slow
+    def test_tiny_token_timestamp_generation(self):
+        set_seed(0)
+        processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
+        model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
+        model.to(torch_device)
+        model.generation_config.alignment_heads = [[2, 2], [3, 0], [3, 2], [3, 3], [3, 4], [3, 5]]
+
+        input_speech = self._load_datasamples(4)
+        input_features = processor.feature_extractor(raw_speech=input_speech, return_tensors="pt").input_features.to(
+            torch_device
+        )
+
+        generate_outputs = model.generate(
+            input_features, max_length=448, return_timestamps=True, return_token_timestamps=True
+        )
+
+        self.assertEqual(generate_outputs.sequences.shape, generate_outputs.token_timestamps.shape)
+
+        # fmt: off
+        EXPECTED_OUTPUT = torch.tensor([
+            [ 0.0000, 0.0000, 0.0000, 0.0000, 0.4800, 0.8200, 0.9600, 1.1200, 1.1200, 1.2200, 1.5000, 1.7200, 2.0000, 2.3400, 2.5000, 2.6600, 3.1800, 3.5600, 3.6800, 3.8000, 4.1000, 4.3000, 4.5800, 4.9400, 5.3800, 12.4200, 12.8400, 26.9200, 26.9200, 26.9200, 26.9200, 26.9200, 26.9200, 26.9200, 26.9200, 26.9200, 26.9200, 26.9200, 26.9400, 26.9400, 26.9400, 26.9400, 29.8400 ],
+            [ 0.0000, 0.0000, 0.0000, 0.0000, 0.5200, 0.9000, 1.1400, 1.4200, 1.5200, 1.6800, 1.6800, 1.8800, 2.1000, 2.2200, 2.6200, 3.1400, 3.5800, 3.9600, 4.4000, 17.3000, 17.3000, 26.7200, 26.7200, 26.7200, 26.7200, 26.7200, 26.7200, 26.7200, 26.7200, 26.7200, 26.7200, 26.7200, 26.7200, 26.7200, 26.7200, 26.7200, 26.7400, 26.7400, 26.7400, 26.7400, 26.7400, 26.7400, 28.0000 ],
+            [ 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.7600, 1.0000, 1.4200, 1.8000, 1.9400, 2.1800, 2.5200, 3.0200, 3.3200, 3.5400, 3.9400, 4.5600, 4.9200, 5.2800, 5.5600, 5.9000, 6.1600, 6.3000, 6.4800, 6.4800, 6.6400, 7.8200, 7.9600, 8.2200, 8.6000, 8.9200, 9.2200, 9.5200, 9.7200, 10.0600, 10.5400, 10.8800, 11.2600, 11.5400, 11.7400, 12.0800, 15.6800, 15.6800],
+            [ 0.0000, 0.0000, 0.0000, 0.0000, 0.0000, 0.7400, 1.0400, 1.3200, 1.6800, 2.1400, 2.4800, 2.7800, 3.0800, 3.1600, 3.4000, 3.6000, 4.0200, 4.2200, 4.8600, 5.2400, 5.7400, 6.3400, 6.6200, 6.7600, 6.7600, 6.8600, 7.2400, 7.4200, 7.6800, 7.9200, 8.4800, 8.7600, 9.2000, 9.2000, 9.4200, 15.8200, 15.8200, 29.6400, 29.6600, 29.6600, 29.6600, 29.6600, 29.7600]
+        ])
+        # fmt: on
+
+        self.assertTrue(torch.allclose(generate_outputs.token_timestamps.to("cpu"), EXPECTED_OUTPUT))
+
+    @slow
+    def test_tiny_specaugment_librispeech(self):
+        torch_device = "cpu"
+        set_seed(0)
+        # Apply SpecAugment
+        model = WhisperModel.from_pretrained("openai/whisper-tiny", apply_spec_augment=True)
+        # Set model to training mode to enable SpecAugment
+        model.train()
+        model.to(torch_device)
+        input_speech = self._load_datasamples(1)
+        feature_extractor = WhisperFeatureExtractor()
+        input_features = feature_extractor(input_speech, return_tensors="pt").input_features
+
+        with torch.no_grad():
+            logits = model(
+                input_features,
+                decoder_input_ids=torch.tensor([[50258, 50259, 50359]]),
+                output_hidden_states=False,
+                output_attentions=False,
+                return_dict=False,
+                use_cache=False,
+            )
+
+        # fmt: off
+        EXPECTED_LOGITS = torch.tensor(
+            [
+                0.9362, -4.7105, 5.0879, 3.9642, 1.0013, -6.0096, 4.7285, -3.1847,
+                -0.8648, 1.9631, 6.2653, 3.6936, 0.3575, -4.5818, 3.0564, 7.8712,
+                2.9951, 0.6848, 9.9497, -2.6638, 1.1571, -6.8546, -1.4333, -7.7584,
+                1.1200, 3.9030, 4.4655, -4.4919, -1.1703, 9.6241
+            ]
+        )
+        # fmt: on
+        self.assertTrue(torch.allclose(logits[0][0, 0, :30].cpu(), EXPECTED_LOGITS, atol=1e-4))
+
+    @slow
+    def test_generate_with_prompt_ids(self):
+        processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
+        model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
+        model.to(torch_device)
+        input_speech = self._load_datasamples(4)[-1:]
+        input_features = processor(input_speech, return_tensors="pt").input_features.to(torch_device)
+
+        output_without_prompt = model.generate(input_features)
+        prompt_ids = processor.get_prompt_ids("Leighton")
+        output_with_prompt = model.generate(input_features, prompt_ids=prompt_ids)
+
+        expected_without_prompt = "<|startoftranscript|><|en|><|transcribe|><|notimestamps|> He has grave doubts whether Sir Frederick Layton's work is really Greek after all and can discover in it but little of Rocky Ithaca.<|endoftext|>"
+        expected_with_prompt = "<|startofprev|> Leighton<|startoftranscript|><|en|><|transcribe|><|notimestamps|> He has grave doubts whether Sir Frederick Leighton's work is really Greek after all and can discover in it but little of Rocky Ithaca.<|endoftext|>"
+        self.assertEqual(processor.decode(output_without_prompt[0]), expected_without_prompt)
+        self.assertEqual(processor.decode(output_with_prompt[0]), expected_with_prompt)
+
+    @slow
+    def test_generate_with_prompt_ids_and_forced_decoder_ids(self):
+        processor = WhisperProcessor.from_pretrained("openai/whisper-tiny")
+        model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny")
+        model.to(torch_device)
+        input_speech = self._load_datasamples(1)
+        input_features = processor(input_speech, return_tensors="pt").input_features.to(torch_device)
+        task = "translate"
+        language = "de"
+        expected_tokens = [f"<|{task}|>", f"<|{language}|>"]
+        prompt = "test prompt"
+        prompt_ids = processor.get_prompt_ids(prompt)
+
+        output = model.generate(input_features, task=task, language=language, prompt_ids=prompt_ids)
+        text = processor.decode(output[0])
+
+        self.assertTrue(prompt in text)
+        self.assertTrue(all(token in text for token in expected_tokens))
+
+    @slow
+    def test_generate_with_prompt_ids_and_no_non_prompt_forced_decoder_ids(self):
+        processor = WhisperProcessor.from_pretrained("openai/whisper-tiny.en")
+        model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-tiny.en")
+        model.to(torch_device)
+        input_speech = self._load_datasamples(1)
+        input_features = processor(input_speech, return_tensors="pt").input_features.to(torch_device)
+        prompt = "test prompt"
+        prompt_ids = processor.get_prompt_ids(prompt)
+
+        model.generation_config.forced_decoder_ids = None
+        model.config.forced_decoder_ids = None
+
+        output = model.generate(input_features, prompt_ids=prompt_ids, return_timestamps=True)
+        text = processor.decode(output[0])
+
+        self.assertTrue(prompt in text)
+
+
+def prepare_whisper_encoder_inputs_dict(config, input_features, head_mask=None):
+    if head_mask is None:
+        head_mask = torch.ones(config.encoder_layers, config.encoder_attention_heads, device=torch_device)
+    return {"input_features": input_features, "head_mask": head_mask}
+
+
+@require_torch
+class WhisperEncoderModelTester:
+    def __init__(
+        self,
+        parent,
+        batch_size=2,
+        seq_length=60,
+        is_training=True,
+        use_labels=True,
+        hidden_size=16,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        input_channels=1,
+        hidden_act="gelu",
+        hidden_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.1,
+        max_position_embeddings=20,
+        max_source_positions=30,
+        num_mel_bins=80,
+        num_conv_layers=1,
+        suppress_tokens=None,
+        begin_suppress_tokens=None,
+        classifier_proj_size=4,
+        num_labels=2,
+        is_encoder_decoder=False,
+        is_decoder=False,
+    ):
+        self.parent = parent
+        self.batch_size = batch_size
+        self.seq_length = seq_length
+        self.is_training = is_training
+        self.use_labels = use_labels
+        self.hidden_size = hidden_size
+        self.num_hidden_layers = num_hidden_layers
+        self.num_attention_heads = num_attention_heads
+        self.input_channels = input_channels
+        self.hidden_act = hidden_act
+        self.hidden_dropout_prob = hidden_dropout_prob
+        self.attention_probs_dropout_prob = attention_probs_dropout_prob
+        self.num_mel_bins = num_mel_bins
+        self.max_position_embeddings = max_position_embeddings
+        self.max_source_positions = max_source_positions
+        self.num_conv_layers = num_conv_layers
+        self.suppress_tokens = suppress_tokens
+        self.begin_suppress_tokens = begin_suppress_tokens
+        self.classifier_proj_size = classifier_proj_size
+        self.num_labels = num_labels
+        self.is_encoder_decoder = is_encoder_decoder
+        self.is_decoder = is_decoder
+
+    def get_config(self):
+        return WhisperConfig(
+            d_model=self.hidden_size,
+            encoder_layers=self.num_hidden_layers,
+            decoder_layers=self.num_hidden_layers,
+            encoder_attention_heads=self.num_attention_heads,
+            decoder_attention_heads=self.num_attention_heads,
+            input_channels=self.input_channels,
+            dropout=self.hidden_dropout_prob,
+            attention_dropout=self.attention_probs_dropout_prob,
+            max_position_embeddings=self.max_position_embeddings,
+            max_source_positions=self.max_source_positions,
+            decoder_ffn_dim=self.hidden_size,
+            encoder_ffn_dim=self.hidden_size,
+            suppress_tokens=self.suppress_tokens,
+            begin_suppress_tokens=self.begin_suppress_tokens,
+            classifier_proj_size=self.classifier_proj_size,
+            num_labels=self.num_labels,
+            is_encoder_decoder=self.is_encoder_decoder,
+            is_decoder=self.is_decoder,
+        )
+
+    def prepare_config_and_inputs(self):
+        input_features = floats_tensor([self.batch_size, self.num_mel_bins, self.seq_length])
+
+        config = self.get_config()
+        inputs_dict = prepare_whisper_encoder_inputs_dict(
+            config,
+            input_features=input_features,
+        )
+        return config, inputs_dict
+
+    def prepare_config_and_inputs_for_common(self):
+        config, inputs_dict = self.prepare_config_and_inputs()
+        return config, inputs_dict
+
+    def get_subsampled_output_lengths(self, input_lengths):
+        """
+        Computes the output length of the convolutional layers
+        """
+
+        for i in range(self.num_conv_layers):
+            input_lengths = (input_lengths - 1) // 2 + 1
+
+        return input_lengths
+
+    @property
+    def encoder_seq_length(self):
+        return self.get_subsampled_output_lengths(self.seq_length)
+
+    def create_and_check_model_forward(self, config, inputs_dict, freeze_encoder=False):
+        model = WhisperForAudioClassification(config=config).to(torch_device).eval()
+
+        if freeze_encoder:
+            model.freeze_encoder()
+
+        input_features = inputs_dict["input_features"]
+
+        # first forward pass
+        last_hidden_state = model(input_features).logits
+
+        self.parent.assertTrue(last_hidden_state.shape, (13, 2))
+
+
+@require_torch
+class WhisperEncoderModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
+    all_model_classes = (WhisperForAudioClassification,) if is_torch_available() else ()
+    is_encoder_decoder = False
+    fx_compatible = False
+    test_pruning = False
+    test_missing_keys = False
+
+    input_name = "input_features"
+
+    def setUp(self):
+        self.model_tester = WhisperEncoderModelTester(self)
+        self.config_tester = ConfigTester(self, config_class=WhisperConfig)
+        self.maxDiff = 3000
+
+    def test_config(self):
+        self.config_tester.run_common_tests()
+
+    def test_forward_signature(self):
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            signature = inspect.signature(model.forward)
+            # signature.parameters is an OrderedDict => so arg_names order is deterministic
+            arg_names = [*signature.parameters.keys()]
+
+            expected_arg_names = ["input_features", "head_mask", "encoder_outputs"]
+            self.assertListEqual(arg_names[: len(expected_arg_names)], expected_arg_names)
+
+    @unittest.skip(reason="Some undefined behavior encountered with tiny versions of this model. Skip for now.")
+    def test_cpu_offload(self):
+        pass
+
+    @unittest.skip(reason="Some undefined behavior encountered with tiny versions of this model. Skip for now.")
+    def test_disk_offload(self):
+        pass
+
+    @unittest.skip(reason="Some undefined behavior encountered with tiny versions of this model. Skip for now.")
+    def test_model_parallelism(self):
+        pass
+
+    # input embeds is meaningless for an encoder-only acoustic model
+    def test_inputs_embeds(self):
+        pass
+
+    # the equivalent test is passing the encoder outputs directly to the model
+    def test_encoder_outputs(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            model.to(torch_device)
+            model.eval()
+
+            inputs = copy.deepcopy(self._prepare_for_class(inputs_dict, model_class))
+
+            with torch.no_grad():
+                outputs = model(**inputs)[0]
+
+            input_ids = inputs["input_features"]
+            del inputs["input_features"]
+
+            encoder = model.encoder
+
+            with torch.no_grad():
+                inputs["encoder_outputs"] = encoder(input_ids)
+                outputs_embeds = model(**inputs)[0]
+
+            self.assertTrue((outputs_embeds == outputs).all())
+
+    # Needs to override as the encoder input embedding is a Conv1d
+    def test_model_common_attributes(self):
+        config, _ = self.model_tester.prepare_config_and_inputs_for_common()
+
+        for model_class in self.all_model_classes:
+            model = model_class(config)
+            self.assertIsInstance(model.get_input_embeddings(), (torch.nn.Conv1d))
+            model.set_input_embeddings(torch.nn.Conv1d(10, 10, 3))
+            x = model.get_output_embeddings()
+            self.assertTrue(x is None or isinstance(x, torch.nn.Conv1d))
+
+    # WhisperEncoder cannot resize token embeddings since it has no tokens embeddings
+    def test_resize_tokens_embeddings(self):
+        pass
+
+    @is_pt_flax_cross_test
+    def test_equivalence_pt_to_flax(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        init_shape = (1,) + inputs_dict["input_features"].shape[1:]
+
+        for model_class in self.all_model_classes:
+            with self.subTest(model_class.__name__):
+                fx_model_class_name = "Flax" + model_class.__name__
+
+                if not hasattr(transformers, fx_model_class_name):
+                    # no flax model exists for this class
+                    return
+
+                # Output all for aggressive testing
+                config.output_hidden_states = True
+                config.output_attentions = self.has_attentions
+
+                fx_model_class = getattr(transformers, fx_model_class_name)
+
+                # load PyTorch class
+                pt_model = model_class(config).eval()
+                # Flax models don't use the `use_cache` option and cache is not returned as a default.
+                # So we disable `use_cache` here for PyTorch model.
+                pt_model.config.use_cache = False
+
+                # load Flax class
+                fx_model = fx_model_class(config, input_shape=init_shape, dtype=jnp.float32)
+
+                # make sure only flax inputs are forward that actually exist in function args
+                fx_input_keys = inspect.signature(fx_model.__call__).parameters.keys()
+
+                # prepare inputs
+                pt_inputs = self._prepare_for_class(inputs_dict, model_class)
+
+                # remove function args that don't exist in Flax
+                pt_inputs = {k: v for k, v in pt_inputs.items() if k in fx_input_keys}
+
+                # send pytorch inputs to the correct device
+                pt_inputs = {
+                    k: v.to(device=torch_device) if isinstance(v, torch.Tensor) else v for k, v in pt_inputs.items()
+                }
+
+                # convert inputs to Flax
+                fx_inputs = {k: np.array(v.to("cpu")) for k, v in pt_inputs.items() if torch.is_tensor(v)}
+
+                fx_state = convert_pytorch_state_dict_to_flax(pt_model.state_dict(), fx_model)
+                fx_model.params = fx_state
+
+                # send pytorch model to the correct device
+                pt_model.to(torch_device)
+
+                with torch.no_grad():
+                    pt_outputs = pt_model(**pt_inputs)
+                fx_outputs = fx_model(**fx_inputs)
+
+                fx_keys = tuple([k for k, v in fx_outputs.items() if v is not None])
+                pt_keys = tuple([k for k, v in pt_outputs.items() if v is not None])
+
+                self.assertEqual(fx_keys, pt_keys)
+                self.check_pt_flax_outputs(fx_outputs, pt_outputs, model_class)
+
+                with tempfile.TemporaryDirectory() as tmpdirname:
+                    pt_model.save_pretrained(tmpdirname)
+                    fx_model_loaded = fx_model_class.from_pretrained(tmpdirname, input_shape=init_shape, from_pt=True)
+
+                fx_outputs_loaded = fx_model_loaded(**fx_inputs)
+
+                fx_keys = tuple([k for k, v in fx_outputs_loaded.items() if v is not None])
+                pt_keys = tuple([k for k, v in pt_outputs.items() if v is not None])
+
+                self.assertEqual(fx_keys, pt_keys)
+                self.check_pt_flax_outputs(fx_outputs_loaded, pt_outputs, model_class)
+
+    @is_pt_flax_cross_test
+    def test_equivalence_flax_to_pt(self):
+        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
+        init_shape = (1,) + inputs_dict["input_features"].shape[1:]
+
+        for model_class in self.all_model_classes:
+            with self.subTest(model_class.__name__):
+                fx_model_class_name = "Flax" + model_class.__name__
+
+                if not hasattr(transformers, fx_model_class_name):
+                    # no flax model exists for this class
+                    return
+
+                # Output all for aggressive testing
+                config.output_hidden_states = True
+                config.output_attentions = self.has_attentions
+
+                fx_model_class = getattr(transformers, fx_model_class_name)
+
+                # load PyTorch class
+                pt_model = model_class(config).eval()
+                # Flax models don't use the `use_cache` option and cache is not returned as a default.
+                # So we disable `use_cache` here for PyTorch model.
+                pt_model.config.use_cache = False
+
+                # load Flax class
+                fx_model = fx_model_class(config, input_shape=init_shape, dtype=jnp.float32)
+
+                # make sure only flax inputs are forward that actually exist in function args
+                fx_input_keys = inspect.signature(fx_model.__call__).parameters.keys()
+
+                # prepare inputs
+                pt_inputs = self._prepare_for_class(inputs_dict, model_class)
+
+                # remove function args that don't exist in Flax
+                pt_inputs = {k: v for k, v in pt_inputs.items() if k in fx_input_keys}
+
+                # send pytorch inputs to the correct device
+                pt_inputs = {
+                    k: v.to(device=torch_device) if isinstance(v, torch.Tensor) else v for k, v in pt_inputs.items()
+                }
+
+                # convert inputs to Flax
+                fx_inputs = {k: np.array(v.to("cpu")) for k, v in pt_inputs.items() if torch.is_tensor(v)}
+
+                pt_model = load_flax_weights_in_pytorch_model(pt_model, fx_model.params)
+
+                # make sure weights are tied in PyTorch
+                pt_model.tie_weights()
+
+                # send pytorch model to the correct device
+                pt_model.to(torch_device)
+
+                with torch.no_grad():
+                    pt_outputs = pt_model(**pt_inputs)
+                fx_outputs = fx_model(**fx_inputs)
+
+                fx_keys = tuple([k for k, v in fx_outputs.items() if v is not None])
+                pt_keys = tuple([k for k, v in pt_outputs.items() if v is not None])
+
+                self.assertEqual(fx_keys, pt_keys)
+                self.check_pt_flax_outputs(fx_outputs, pt_outputs, model_class)
+
+                with tempfile.TemporaryDirectory() as tmpdirname:
+                    fx_model.save_pretrained(tmpdirname)
+                    pt_model_loaded = model_class.from_pretrained(tmpdirname, from_flax=True)
+
+                # send pytorch model to the correct device
+                pt_model_loaded.to(torch_device)
+                pt_model_loaded.eval()
+
+                with torch.no_grad():
+                    pt_outputs_loaded = pt_model_loaded(**pt_inputs)
+
+                fx_keys = tuple([k for k, v in fx_outputs.items() if v is not None])
+                pt_keys = tuple([k for k, v in pt_outputs_loaded.items() if v is not None])
+
+                self.assertEqual(fx_keys, pt_keys)
+                self.check_pt_flax_outputs(fx_outputs, pt_outputs_loaded, model_class)

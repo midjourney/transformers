@@ -31,7 +31,7 @@ from ...modeling_outputs import (
     TokenClassifierOutput,
 )
 from ...modeling_utils import PreTrainedModel
-from ...pytorch_utils import apply_chunking_to_forward, torch_int_div
+from ...pytorch_utils import apply_chunking_to_forward
 from ...utils import (
     add_start_docstrings,
     add_start_docstrings_to_model_forward,
@@ -52,7 +52,6 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "microsoft/layoutlmv2-base-uncased"
 _CONFIG_FOR_DOC = "LayoutLMv2Config"
-_TOKENIZER_FOR_DOC = "LayoutLMv2Tokenizer"
 
 LAYOUTLMV2_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "microsoft/layoutlmv2-base-uncased",
@@ -78,7 +77,9 @@ class LayoutLMv2Embeddings(nn.Module):
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
+        self.register_buffer(
+            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
+        )
 
     def _calc_spatial_position_embeddings(self, bbox):
         try:
@@ -507,7 +508,6 @@ class LayoutLMv2PreTrainedModel(PreTrainedModel):
     config_class = LayoutLMv2Config
     pretrained_model_archive_map = LAYOUTLMV2_PRETRAINED_MODEL_ARCHIVE_LIST
     base_model_prefix = "layoutlmv2"
-    _keys_to_ignore_on_load_missing = [r"position_ids"]
 
     def _init_weights(self, module):
         """Initialize the weights"""
@@ -568,8 +568,11 @@ class LayoutLMv2VisualBackbone(nn.Module):
         self.register_buffer(
             "pixel_mean",
             torch.Tensor(self.cfg.MODEL.PIXEL_MEAN).view(num_channels, 1, 1),
+            persistent=False,
         )
-        self.register_buffer("pixel_std", torch.Tensor(self.cfg.MODEL.PIXEL_STD).view(num_channels, 1, 1))
+        self.register_buffer(
+            "pixel_std", torch.Tensor(self.cfg.MODEL.PIXEL_STD).view(num_channels, 1, 1), persistent=False
+        )
         self.out_feature_key = "p2"
         if torch.are_deterministic_algorithms_enabled():
             logger.warning("using `AvgPool2d` instead of `AdaptiveAvgPool2d`")
@@ -605,7 +608,7 @@ class LayoutLMv2VisualBackbone(nn.Module):
         self_rank = torch.distributed.get_rank()
         node_size = torch.cuda.device_count()
         world_size = torch.distributed.get_world_size()
-        if not (world_size & node_size == 0):
+        if not (world_size % node_size == 0):
             raise RuntimeError("Make sure the number of processes can be divided by the number of nodes")
 
         node_global_ranks = [list(range(i * node_size, (i + 1) * node_size)) for i in range(world_size // node_size)]
@@ -633,7 +636,7 @@ LAYOUTLMV2_INPUTS_DOCSTRING = r"""
         input_ids (`torch.LongTensor` of shape `{0}`):
             Indices of input sequence tokens in the vocabulary.
 
-            Indices can be obtained using [`LayoutLMv2Tokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
 
             [What are input IDs?](../glossary#input-ids)
@@ -771,7 +774,7 @@ class LayoutLMv2Model(LayoutLMv2PreTrainedModel):
         return embeddings
 
     def _calc_visual_bbox(self, image_feature_pool_shape, bbox, device, final_shape):
-        visual_bbox_x = torch_int_div(
+        visual_bbox_x = torch.div(
             torch.arange(
                 0,
                 1000 * (image_feature_pool_shape[1] + 1),
@@ -780,8 +783,9 @@ class LayoutLMv2Model(LayoutLMv2PreTrainedModel):
                 dtype=bbox.dtype,
             ),
             self.config.image_feature_pool_shape[1],
+            rounding_mode="floor",
         )
-        visual_bbox_y = torch_int_div(
+        visual_bbox_y = torch.div(
             torch.arange(
                 0,
                 1000 * (self.config.image_feature_pool_shape[0] + 1),
@@ -790,6 +794,7 @@ class LayoutLMv2Model(LayoutLMv2PreTrainedModel):
                 dtype=bbox.dtype,
             ),
             self.config.image_feature_pool_shape[0],
+            rounding_mode="floor",
         )
         visual_bbox = torch.stack(
             [
@@ -837,14 +842,14 @@ class LayoutLMv2Model(LayoutLMv2PreTrainedModel):
         Examples:
 
         ```python
-        >>> from transformers import LayoutLMv2Processor, LayoutLMv2Model, set_seed
+        >>> from transformers import AutoProcessor, LayoutLMv2Model, set_seed
         >>> from PIL import Image
         >>> import torch
         >>> from datasets import load_dataset
 
         >>> set_seed(88)
 
-        >>> processor = LayoutLMv2Processor.from_pretrained("microsoft/layoutlmv2-base-uncased")
+        >>> processor = AutoProcessor.from_pretrained("microsoft/layoutlmv2-base-uncased")
         >>> model = LayoutLMv2Model.from_pretrained("microsoft/layoutlmv2-base-uncased")
 
 
@@ -1008,7 +1013,7 @@ class LayoutLMv2ForSequenceClassification(LayoutLMv2PreTrainedModel):
         Example:
 
         ```python
-        >>> from transformers import LayoutLMv2Processor, LayoutLMv2ForSequenceClassification, set_seed
+        >>> from transformers import AutoProcessor, LayoutLMv2ForSequenceClassification, set_seed
         >>> from PIL import Image
         >>> import torch
         >>> from datasets import load_dataset
@@ -1019,7 +1024,7 @@ class LayoutLMv2ForSequenceClassification(LayoutLMv2PreTrainedModel):
         >>> data = next(iter(dataset))
         >>> image = data["image"].convert("RGB")
 
-        >>> processor = LayoutLMv2Processor.from_pretrained("microsoft/layoutlmv2-base-uncased")
+        >>> processor = AutoProcessor.from_pretrained("microsoft/layoutlmv2-base-uncased")
         >>> model = LayoutLMv2ForSequenceClassification.from_pretrained(
         ...     "microsoft/layoutlmv2-base-uncased", num_labels=dataset.info.features["label"].num_classes
         ... )
@@ -1042,6 +1047,7 @@ class LayoutLMv2ForSequenceClassification(LayoutLMv2PreTrainedModel):
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
+            self.warn_if_padding_and_no_attention_mask(input_ids, attention_mask)
             input_shape = input_ids.size()
         elif inputs_embeds is not None:
             input_shape = inputs_embeds.size()[:-1]
@@ -1187,7 +1193,7 @@ class LayoutLMv2ForTokenClassification(LayoutLMv2PreTrainedModel):
         Example:
 
         ```python
-        >>> from transformers import LayoutLMv2Processor, LayoutLMv2ForTokenClassification, set_seed
+        >>> from transformers import AutoProcessor, LayoutLMv2ForTokenClassification, set_seed
         >>> from PIL import Image
         >>> from datasets import load_dataset
 
@@ -1197,7 +1203,7 @@ class LayoutLMv2ForTokenClassification(LayoutLMv2PreTrainedModel):
         >>> labels = datasets.features["ner_tags"].feature.names
         >>> id2label = {v: k for v, k in enumerate(labels)}
 
-        >>> processor = LayoutLMv2Processor.from_pretrained("microsoft/layoutlmv2-base-uncased", revision="no_ocr")
+        >>> processor = AutoProcessor.from_pretrained("microsoft/layoutlmv2-base-uncased", revision="no_ocr")
         >>> model = LayoutLMv2ForTokenClassification.from_pretrained(
         ...     "microsoft/layoutlmv2-base-uncased", num_labels=len(labels)
         ... )
@@ -1328,13 +1334,13 @@ class LayoutLMv2ForQuestionAnswering(LayoutLMv2PreTrainedModel):
         a prediction of what it thinks the answer is (the span of the answer within the texts parsed from the image).
 
         ```python
-        >>> from transformers import LayoutLMv2Processor, LayoutLMv2ForQuestionAnswering, set_seed
+        >>> from transformers import AutoProcessor, LayoutLMv2ForQuestionAnswering, set_seed
         >>> import torch
         >>> from PIL import Image
         >>> from datasets import load_dataset
 
         >>> set_seed(88)
-        >>> processor = LayoutLMv2Processor.from_pretrained("microsoft/layoutlmv2-base-uncased")
+        >>> processor = AutoProcessor.from_pretrained("microsoft/layoutlmv2-base-uncased")
         >>> model = LayoutLMv2ForQuestionAnswering.from_pretrained("microsoft/layoutlmv2-base-uncased")
 
         >>> dataset = load_dataset("hf-internal-testing/fixtures_docvqa")

@@ -15,6 +15,8 @@
 """ Testing suite for the TensorFlow ViTMAE model. """
 
 
+from __future__ import annotations
+
 import copy
 import inspect
 import json
@@ -32,6 +34,7 @@ from transformers.testing_utils import require_tf, require_vision, slow
 
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_tf_common import TFModelTesterMixin, floats_tensor, ids_tensor
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_tf_available():
@@ -43,7 +46,7 @@ if is_tf_available():
 if is_vision_available():
     from PIL import Image
 
-    from transformers import ViTFeatureExtractor
+    from transformers import ViTImageProcessor
 
 
 class TFViTMAEModelTester:
@@ -57,7 +60,7 @@ class TFViTMAEModelTester:
         is_training=True,
         use_labels=True,
         hidden_size=32,
-        num_hidden_layers=5,
+        num_hidden_layers=2,
         num_attention_heads=4,
         intermediate_size=37,
         hidden_act="gelu",
@@ -155,13 +158,14 @@ class TFViTMAEModelTester:
 
 
 @require_tf
-class TFViTMAEModelTest(TFModelTesterMixin, unittest.TestCase):
+class TFViTMAEModelTest(TFModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     """
     Here we also overwrite some of the tests of test_modeling_common.py, as ViTMAE does not use input_ids, inputs_embeds,
     attention_mask and seq_length.
     """
 
     all_model_classes = (TFViTMAEModel, TFViTMAEForPreTraining) if is_tf_available() else ()
+    pipeline_model_mapping = {"feature-extraction": TFViTMAEModel} if is_tf_available() else {}
 
     test_pruning = False
     test_onnx = False
@@ -266,7 +270,6 @@ class TFViTMAEModelTest(TFModelTesterMixin, unittest.TestCase):
     # overwrite from common since TFViTMAEForPretraining has random masking, we need to fix the noise
     # to generate masks during test
     def check_pt_tf_models(self, tf_model, pt_model, tf_inputs_dict):
-
         # make masks reproducible
         np.random.seed(2)
 
@@ -280,52 +283,6 @@ class TFViTMAEModelTest(TFModelTesterMixin, unittest.TestCase):
 
         super().check_pt_tf_models(tf_model, pt_model, tf_inputs_dict)
 
-    # overwrite from common since TFViTMAEForPretraining outputs loss along with
-    # logits and mask indices. loss and mask indices are not suitable for integration
-    # with other keras modules.
-    def test_compile_tf_model(self):
-        config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
-        optimizer = tf.keras.optimizers.Adam(learning_rate=3e-5, epsilon=1e-08, clipnorm=1.0)
-        loss = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=True)
-        metric = tf.keras.metrics.SparseCategoricalAccuracy("accuracy")
-
-        for model_class in self.all_model_classes:
-            # `pixel_values` implies that the input is an image
-            inputs = tf.keras.Input(
-                batch_shape=(
-                    3,
-                    self.model_tester.num_channels,
-                    self.model_tester.image_size,
-                    self.model_tester.image_size,
-                ),
-                name="pixel_values",
-                dtype="float32",
-            )
-
-            # Prepare our model
-            model = model_class(config)
-            model(self._prepare_for_class(inputs_dict, model_class))  # Model must be called before saving.
-            # Let's load it from the disk to be sure we can use pretrained weights
-            with tempfile.TemporaryDirectory() as tmpdirname:
-                model.save_pretrained(tmpdirname, saved_model=False)
-                model = model_class.from_pretrained(tmpdirname)
-
-            outputs_dict = model(inputs)
-            hidden_states = outputs_dict[0]
-
-            # `TFViTMAEForPreTraining` outputs are not recommended to be used for
-            #  downstream application. This is just to check if the outputs of
-            # `TFViTMAEForPreTraining` can be integrated with other keras modules.
-            if model_class.__name__ == "TFViTMAEForPreTraining":
-                hidden_states = outputs_dict["logits"]
-
-            # Add a dense layer on top to test integration with other keras modules
-            outputs = tf.keras.layers.Dense(2, activation="softmax", name="outputs")(hidden_states)
-
-            # Compile extended model
-            extended_model = tf.keras.Model(inputs=[inputs], outputs=[outputs])
-            extended_model.compile(optimizer=optimizer, loss=loss, metrics=[metric])
-
     # overwrite from common since TFViTMAEForPretraining has random masking, we need to fix the noise
     # to generate masks during test
     def test_keras_save_load(self):
@@ -334,7 +291,7 @@ class TFViTMAEModelTest(TFModelTesterMixin, unittest.TestCase):
 
         config, inputs_dict = self.model_tester.prepare_config_and_inputs_for_common()
 
-        tf_main_layer_classes = set(
+        tf_main_layer_classes = {
             module_member
             for model_class in self.all_model_classes
             for module in (import_module(model_class.__module__),)
@@ -346,7 +303,7 @@ class TFViTMAEModelTest(TFModelTesterMixin, unittest.TestCase):
             if isinstance(module_member, type)
             and tf.keras.layers.Layer in module_member.__bases__
             and getattr(module_member, "_keras_serializable", False)
-        )
+        }
 
         num_patches = int((config.image_size // config.patch_size) ** 2)
         noise = np.random.uniform(size=(self.model_tester.batch_size, num_patches))
@@ -453,7 +410,6 @@ class TFViTMAEModelTest(TFModelTesterMixin, unittest.TestCase):
 
     @slow
     def test_model_from_pretrained(self):
-
         model = TFViTMAEModel.from_pretrained("google/vit-base-patch16-224")
         self.assertIsNotNone(model)
 
@@ -468,8 +424,8 @@ def prepare_img():
 @require_vision
 class TFViTMAEModelIntegrationTest(unittest.TestCase):
     @cached_property
-    def default_feature_extractor(self):
-        return ViTFeatureExtractor.from_pretrained("facebook/vit-mae-base") if is_vision_available() else None
+    def default_image_processor(self):
+        return ViTImageProcessor.from_pretrained("facebook/vit-mae-base") if is_vision_available() else None
 
     @slow
     def test_inference_for_pretraining(self):
@@ -478,9 +434,9 @@ class TFViTMAEModelIntegrationTest(unittest.TestCase):
 
         model = TFViTMAEForPreTraining.from_pretrained("facebook/vit-mae-base")
 
-        feature_extractor = self.default_feature_extractor
+        image_processor = self.default_image_processor
         image = prepare_img()
-        inputs = feature_extractor(images=image, return_tensors="tf")
+        inputs = image_processor(images=image, return_tensors="tf")
 
         # prepare a noise vector that will be also used for testing the TF model
         # (this way we can ensure that the PT and TF models operate on the same inputs)

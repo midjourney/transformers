@@ -1,7 +1,3 @@
-# flake8: noqa
-# There's no way to ignore "F401 '...' imported but unused" warnings in this
-# module, but to preserve other warnings. So, don't check this module at all.
-
 # Copyright 2022 The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,8 +13,13 @@
 # limitations under the License.
 from typing import TYPE_CHECKING
 
-# rely on isort to merge the imports
-from ...utils import OptionalDependencyNotAvailable, _LazyModule, is_tf_available, is_torch_available
+from ...utils import (
+    OptionalDependencyNotAvailable,
+    _LazyModule,
+    is_flax_available,
+    is_tf_available,
+    is_torch_available,
+)
 
 
 _import_structure = {
@@ -36,6 +37,7 @@ else:
         "ResNetForImageClassification",
         "ResNetModel",
         "ResNetPreTrainedModel",
+        "ResNetBackbone",
     ]
 
 try:
@@ -51,6 +53,17 @@ else:
         "TFResNetPreTrainedModel",
     ]
 
+try:
+    if not is_flax_available():
+        raise OptionalDependencyNotAvailable()
+except OptionalDependencyNotAvailable:
+    pass
+else:
+    _import_structure["modeling_flax_resnet"] = [
+        "FlaxResNetForImageClassification",
+        "FlaxResNetModel",
+        "FlaxResNetPreTrainedModel",
+    ]
 
 if TYPE_CHECKING:
     from .configuration_resnet import RESNET_PRETRAINED_CONFIG_ARCHIVE_MAP, ResNetConfig, ResNetOnnxConfig
@@ -63,6 +76,7 @@ if TYPE_CHECKING:
     else:
         from .modeling_resnet import (
             RESNET_PRETRAINED_MODEL_ARCHIVE_LIST,
+            ResNetBackbone,
             ResNetForImageClassification,
             ResNetModel,
             ResNetPreTrainedModel,
@@ -80,6 +94,14 @@ if TYPE_CHECKING:
             TFResNetModel,
             TFResNetPreTrainedModel,
         )
+
+    try:
+        if not is_flax_available():
+            raise OptionalDependencyNotAvailable()
+    except OptionalDependencyNotAvailable:
+        pass
+    else:
+        from .modeling_flax_resnet import FlaxResNetForImageClassification, FlaxResNetModel, FlaxResNetPreTrainedModel
 
 
 else:

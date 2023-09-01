@@ -21,6 +21,7 @@ import tempfile
 import unittest
 
 import numpy as np
+from datasets import load_dataset
 
 from transformers import is_speech_available
 from transformers.testing_utils import check_json_file_has_correct_format, require_torch, require_torchaudio
@@ -66,7 +67,7 @@ class WhisperFeatureExtractionTester(unittest.TestCase):
         chunk_length=8,
         padding_value=0.0,
         sampling_rate=4_000,
-        return_attention_mask=True,
+        return_attention_mask=False,
         do_normalize=True,
     ):
         self.parent = parent
@@ -113,7 +114,6 @@ class WhisperFeatureExtractionTester(unittest.TestCase):
 @require_torch
 @require_torchaudio
 class WhisperFeatureExtractionTest(SequenceFeatureExtractionTestMixin, unittest.TestCase):
-
     feature_extraction_class = WhisperFeatureExtractor if is_speech_available() else None
 
     def setUp(self):
@@ -129,8 +129,8 @@ class WhisperFeatureExtractionTest(SequenceFeatureExtractionTestMixin, unittest.
 
         dict_first = feat_extract_first.to_dict()
         dict_second = feat_extract_second.to_dict()
-        mel_1 = dict_first.pop("mel_filters")
-        mel_2 = dict_second.pop("mel_filters")
+        mel_1 = feat_extract_first.mel_filters
+        mel_2 = feat_extract_second.mel_filters
         self.assertTrue(np.allclose(mel_1, mel_2))
         self.assertEqual(dict_first, dict_second)
 
@@ -144,8 +144,8 @@ class WhisperFeatureExtractionTest(SequenceFeatureExtractionTestMixin, unittest.
 
         dict_first = feat_extract_first.to_dict()
         dict_second = feat_extract_second.to_dict()
-        mel_1 = dict_first.pop("mel_filters")
-        mel_2 = dict_second.pop("mel_filters")
+        mel_1 = feat_extract_first.mel_filters
+        mel_2 = feat_extract_second.mel_filters
         self.assertTrue(np.allclose(mel_1, mel_2))
         self.assertEqual(dict_first, dict_second)
 
@@ -168,6 +168,14 @@ class WhisperFeatureExtractionTest(SequenceFeatureExtractionTestMixin, unittest.
         self.assertTrue(np.allclose(encoded_sequences_1, encoded_sequences_2, atol=1e-3))
 
         # Test batched
+        encoded_sequences_1 = feature_extractor(speech_inputs, return_tensors="np").input_features
+        encoded_sequences_2 = feature_extractor(np_speech_inputs, return_tensors="np").input_features
+        for enc_seq_1, enc_seq_2 in zip(encoded_sequences_1, encoded_sequences_2):
+            self.assertTrue(np.allclose(enc_seq_1, enc_seq_2, atol=1e-3))
+
+        # Test 2-D numpy arrays are batched.
+        speech_inputs = [floats_list((1, x))[0] for x in (800, 800, 800)]
+        np_speech_inputs = np.asarray(speech_inputs)
         encoded_sequences_1 = feature_extractor(speech_inputs, return_tensors="np").input_features
         encoded_sequences_2 = feature_extractor(np_speech_inputs, return_tensors="np").input_features
         for enc_seq_1, enc_seq_2 in zip(encoded_sequences_1, encoded_sequences_2):
@@ -199,8 +207,6 @@ class WhisperFeatureExtractionTest(SequenceFeatureExtractionTestMixin, unittest.
             self.assertTrue(pt_processed.input_features.dtype == torch.float32)
 
     def _load_datasamples(self, num_samples):
-        from datasets import load_dataset
-
         ds = load_dataset("hf-internal-testing/librispeech_asr_dummy", "clean", split="validation")
         # automatic decoding with librispeech
         speech_samples = ds.sort("id").select(range(num_samples))[:num_samples]["audio"]
@@ -220,6 +226,16 @@ class WhisperFeatureExtractionTest(SequenceFeatureExtractionTestMixin, unittest.
         # fmt: on
 
         input_speech = self._load_datasamples(1)
-        feaure_extractor = WhisperFeatureExtractor()
-        input_features = feaure_extractor(input_speech, return_tensors="pt").input_features
+        feature_extractor = WhisperFeatureExtractor()
+        input_features = feature_extractor(input_speech, return_tensors="pt").input_features
+        self.assertEqual(input_features.shape, (1, 80, 3000))
         self.assertTrue(torch.allclose(input_features[0, 0, :30], EXPECTED_INPUT_FEATURES, atol=1e-4))
+
+    def test_zero_mean_unit_variance_normalization_trunc_np_longest(self):
+        feat_extract = self.feature_extraction_class(**self.feat_extract_tester.prepare_feat_extract_dict())
+        audio = self._load_datasamples(1)[0]
+        audio = ((audio - audio.min()) / (audio.max() - audio.min())) * 65535  # Rescale to [0, 65535] to show issue
+        audio = feat_extract.zero_mean_unit_var_norm([audio], attention_mask=None)[0]
+
+        self.assertTrue(np.all(np.mean(audio) < 1e-3))
+        self.assertTrue(np.all(np.abs(np.var(audio) - 1) < 1e-3))

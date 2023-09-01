@@ -31,6 +31,7 @@ from ...test_modeling_common import (
     ids_tensor,
     random_attention_mask,
 )
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
@@ -71,7 +72,7 @@ class SEWDModelTester:
         position_biased_input=False,
         pos_att_type=("p2c", "c2p"),
         norm_rel_ebd="layer_norm",
-        num_hidden_layers=4,
+        num_hidden_layers=2,
         num_attention_heads=2,
         hidden_dropout=0.1,
         intermediate_size=20,
@@ -320,8 +321,17 @@ class SEWDModelTester:
 
 
 @require_torch
-class SEWDModelTest(ModelTesterMixin, unittest.TestCase):
+class SEWDModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (SEWDForCTC, SEWDModel, SEWDForSequenceClassification) if is_torch_available() else ()
+    pipeline_model_mapping = (
+        {
+            "audio-classification": SEWDForSequenceClassification,
+            "automatic-speech-recognition": SEWDForCTC,
+            "feature-extraction": SEWDModel,
+        }
+        if is_torch_available()
+        else {}
+    )
     test_pruning = False
     test_headmasking = False
     test_torchscript = False
@@ -421,7 +431,7 @@ class SEWDModelTest(ModelTesterMixin, unittest.TestCase):
                     "quantizer.weight_proj.weight",
                 ]
                 if param.requires_grad:
-                    if any([x in name for x in uniform_init_parms]):
+                    if any(x in name for x in uniform_init_parms):
                         self.assertTrue(
                             -1.0 <= ((param.data.mean() * 1e9).round() / 1e9).item() <= 1.0,
                             msg=f"Parameter {name} of model {model_class} seems not properly initialized",

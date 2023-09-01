@@ -141,7 +141,7 @@ class XLMProphetNetTokenizer(PreTrainedTokenizer):
         cls_token="[CLS]",
         mask_token="[MASK]",
         sp_model_kwargs: Optional[Dict[str, Any]] = None,
-        **kwargs
+        **kwargs,
     ) -> None:
         self.sp_model_kwargs = {} if sp_model_kwargs is None else sp_model_kwargs
 
@@ -188,6 +188,10 @@ class XLMProphetNetTokenizer(PreTrainedTokenizer):
         self.fairseq_ids_to_tokens = {v: k for k, v in self.fairseq_tokens_to_ids.items()}
         for k in self.fairseq_tokens_to_ids.keys():
             self.unique_no_split_tokens.append(k)
+
+    @property
+    def can_save_slow_tokenizer(self) -> bool:
+        return os.path.isfile(self.vocab_file) if self.vocab_file else False
 
     def __getstate__(self):
         state = self.__dict__.copy()

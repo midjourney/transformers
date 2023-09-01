@@ -14,11 +14,14 @@
 # limitations under the License.
 """ TF 2.0 ViT MAE (masked autoencoder) model."""
 
+
+from __future__ import annotations
+
 import collections.abc
 import math
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import numpy as np
 import tensorflow as tf
@@ -74,8 +77,8 @@ class TFViTMAEModelOutput(ModelOutput):
     last_hidden_state: tf.Tensor = None
     mask: tf.Tensor = None
     ids_restore: tf.Tensor = None
-    hidden_states: Optional[Tuple[tf.Tensor]] = None
-    attentions: Optional[Tuple[tf.Tensor]] = None
+    hidden_states: Tuple[tf.Tensor] | None = None
+    attentions: Tuple[tf.Tensor] | None = None
 
 
 @dataclass
@@ -97,8 +100,8 @@ class TFViTMAEDecoderOutput(ModelOutput):
     """
 
     logits: tf.Tensor = None
-    hidden_states: Optional[Tuple[tf.Tensor]] = None
-    attentions: Optional[Tuple[tf.Tensor]] = None
+    hidden_states: Tuple[tf.Tensor] | None = None
+    attentions: Tuple[tf.Tensor] | None = None
 
 
 @dataclass
@@ -125,12 +128,12 @@ class TFViTMAEForPreTrainingOutput(ModelOutput):
             the self-attention heads.
     """
 
-    loss: Optional[tf.Tensor] = None
+    loss: tf.Tensor | None = None
     logits: tf.Tensor = None
     mask: tf.Tensor = None
     ids_restore: tf.Tensor = None
-    hidden_states: Optional[Tuple[tf.Tensor]] = None
-    attentions: Optional[Tuple[tf.Tensor]] = None
+    hidden_states: Tuple[tf.Tensor] | None = None
+    attentions: Tuple[tf.Tensor] | None = None
 
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, add_cls_token=False):
@@ -232,7 +235,7 @@ class TFViTMAEEmbeddings(tf.keras.layers.Layer):
 
         super().build(input_shape)
 
-    def random_masking(self, sequence: tf.Tensor, noise: Optional[tf.Tensor] = None):
+    def random_masking(self, sequence: tf.Tensor, noise: tf.Tensor | None = None):
         """
         Perform per-sample random masking by per-sample shuffling. Per-sample shuffling is done by argsort random
         noise.
@@ -254,7 +257,7 @@ class TFViTMAEEmbeddings(tf.keras.layers.Layer):
 
         # keep the first subset
         ids_keep = ids_shuffle[:, :len_keep]
-        sequence_masked = tf.gather(
+        sequence_unmasked = tf.gather(
             sequence,
             axis=1,
             batch_dims=1,
@@ -271,7 +274,7 @@ class TFViTMAEEmbeddings(tf.keras.layers.Layer):
         # unshuffle to get the binary mask
         mask = tf.gather(mask, axis=1, batch_dims=1, indices=ids_restore)
 
-        return sequence_masked, mask, ids_restore
+        return sequence_unmasked, mask, ids_restore
 
     def call(self, pixel_values: tf.Tensor, noise: tf.Tensor = None) -> tf.Tensor:
         embeddings = self.patch_embeddings(pixel_values)
@@ -639,9 +642,9 @@ class TFViTMAEMainLayer(tf.keras.layers.Layer):
     @unpack_inputs
     def call(
         self,
-        pixel_values: Optional[TFModelInputType] = None,
+        pixel_values: TFModelInputType | None = None,
         noise: tf.Tensor = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -695,36 +698,6 @@ class TFViTMAEPreTrainedModel(TFPreTrainedModel):
     base_model_prefix = "vit"
     main_input_name = "pixel_values"
 
-    @property
-    def dummy_inputs(self) -> Dict[str, tf.Tensor]:
-        """
-        Dummy inputs to build the network. Returns:
-            `Dict[str, tf.Tensor]`: The dummy inputs.
-        """
-        VISION_DUMMY_INPUTS = tf.random.uniform(
-            shape=(3, self.config.num_channels, self.config.image_size, self.config.image_size),
-            dtype=tf.float32,
-        )
-        return {"pixel_values": tf.constant(VISION_DUMMY_INPUTS)}
-
-    @tf.function(
-        input_signature=[
-            {
-                "pixel_values": tf.TensorSpec((None, None, None, None), tf.float32, name="pixel_values"),
-            }
-        ]
-    )
-    def serving(self, inputs):
-        """
-        Method used for serving the model.
-
-        Args:
-            inputs (`Dict[str, tf.Tensor]`):
-                The input of the saved model as a dictionary of tensors.
-        """
-        output = self.call(inputs)
-        return self.serving_output(output)
-
 
 VIT_MAE_START_DOCSTRING = r"""
     This model inherits from [`TFPreTrainedModel`]. Check the superclass documentation for the generic methods the
@@ -770,8 +743,8 @@ VIT_MAE_START_DOCSTRING = r"""
 VIT_MAE_INPUTS_DOCSTRING = r"""
     Args:
         pixel_values (`np.ndarray`, `tf.Tensor`, `List[tf.Tensor]` ``Dict[str, tf.Tensor]` or `Dict[str, np.ndarray]` and each example must have the shape `(batch_size, num_channels, height, width)`):
-            Pixel values. Pixel values can be obtained using [`AutoFeatureExtractor`]. See
-            [`AutoFeatureExtractor.__call__`] for details.
+            Pixel values. Pixel values can be obtained using [`AutoImageProcessor`]. See [`ViTImageProcessor.__call__`]
+            for details.
 
         head_mask (`np.ndarray` or `tf.Tensor` of shape `(num_heads,)` or `(num_layers, num_heads)`, *optional*):
             Mask to nullify selected heads of the self-attention modules. Mask values selected in `[0, 1]`:
@@ -816,9 +789,9 @@ class TFViTMAEModel(TFViTMAEPreTrainedModel):
     @replace_return_docstrings(output_type=TFViTMAEModelOutput, config_class=_CONFIG_FOR_DOC)
     def call(
         self,
-        pixel_values: Optional[TFModelInputType] = None,
+        pixel_values: TFModelInputType | None = None,
         noise: tf.Tensor = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -830,17 +803,17 @@ class TFViTMAEModel(TFViTMAEPreTrainedModel):
         Examples:
 
         ```python
-        >>> from transformers import AutoFeatureExtractor, TFViTMAEModel
+        >>> from transformers import AutoImageProcessor, TFViTMAEModel
         >>> from PIL import Image
         >>> import requests
 
         >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
         >>> image = Image.open(requests.get(url, stream=True).raw)
 
-        >>> feature_extractor = AutoFeatureExtractor.from_pretrained("facebook/vit-mae-base")
+        >>> image_processor = AutoImageProcessor.from_pretrained("facebook/vit-mae-base")
         >>> model = TFViTMAEModel.from_pretrained("facebook/vit-mae-base")
 
-        >>> inputs = feature_extractor(images=image, return_tensors="tf")
+        >>> inputs = image_processor(images=image, return_tensors="tf")
         >>> outputs = model(**inputs)
         >>> last_hidden_states = outputs.last_hidden_state
         ```"""
@@ -855,18 +828,6 @@ class TFViTMAEModel(TFViTMAEPreTrainedModel):
         )
 
         return outputs
-
-    def serving_output(self, output: TFViTMAEModelOutput) -> TFViTMAEModelOutput:
-        hidden_states = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
-        attentions = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
-
-        return TFViTMAEModelOutput(
-            last_hidden_state=output.last_hidden_state,
-            mask=output.mask,
-            ids_restore=output.ids_restore,
-            hidden_states=hidden_states,
-            attentions=attentions,
-        )
 
 
 class TFViTMAEDecoder(tf.keras.layers.Layer):
@@ -1005,11 +966,8 @@ class TFViTMAEForPreTraining(TFViTMAEPreTrainedModel):
         """
         patch_size, num_channels = self.config.patch_size, self.config.num_channels
         # make sure channels are last
-        pixel_values = tf.cond(
-            tf.math.equal(shape_list(pixel_values)[1], num_channels),
-            lambda: tf.transpose(pixel_values, perm=(0, 2, 3, 1)),
-            lambda: pixel_values,
-        )
+        if shape_list(pixel_values)[1] == num_channels:
+            pixel_values = tf.transpose(pixel_values, perm=(0, 2, 3, 1))
 
         # sanity checks
         tf.debugging.assert_equal(
@@ -1107,9 +1065,9 @@ class TFViTMAEForPreTraining(TFViTMAEPreTrainedModel):
     @replace_return_docstrings(output_type=TFViTMAEForPreTrainingOutput, config_class=_CONFIG_FOR_DOC)
     def call(
         self,
-        pixel_values: Optional[TFModelInputType] = None,
+        pixel_values: TFModelInputType | None = None,
         noise: tf.Tensor = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -1121,17 +1079,17 @@ class TFViTMAEForPreTraining(TFViTMAEPreTrainedModel):
         Examples:
 
         ```python
-        >>> from transformers import AutoFeatureExtractor, TFViTMAEForPreTraining
+        >>> from transformers import AutoImageProcessor, TFViTMAEForPreTraining
         >>> from PIL import Image
         >>> import requests
 
         >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
         >>> image = Image.open(requests.get(url, stream=True).raw)
 
-        >>> feature_extractor = AutoFeatureExtractor.from_pretrained("facebook/vit-mae-base")
+        >>> image_processor = AutoImageProcessor.from_pretrained("facebook/vit-mae-base")
         >>> model = TFViTMAEForPreTraining.from_pretrained("facebook/vit-mae-base")
 
-        >>> inputs = feature_extractor(images=image, return_tensors="pt")
+        >>> inputs = image_processor(images=image, return_tensors="pt")
         >>> outputs = model(**inputs)
         >>> loss = outputs.loss
         >>> mask = outputs.mask
@@ -1169,16 +1127,4 @@ class TFViTMAEForPreTraining(TFViTMAEPreTrainedModel):
             ids_restore=ids_restore,
             hidden_states=outputs.hidden_states,
             attentions=outputs.attentions,
-        )
-
-    def serving_output(self, output: TFViTMAEForPreTrainingOutput) -> TFViTMAEForPreTrainingOutput:
-        hidden_states = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
-        attentions = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
-
-        return TFViTMAEForPreTrainingOutput(
-            logits=output.logits,
-            mask=output.mask,
-            ids_restore=output.ids_restore,
-            hidden_states=hidden_states,
-            attentions=attentions,
         )

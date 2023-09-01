@@ -16,6 +16,7 @@
 
 import collections
 import math
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -23,18 +24,16 @@ import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
-from transformers import apply_chunking_to_forward
-from transformers.modeling_outputs import (
+from ...activations import ACT2FN
+from ...modeling_outputs import (
     BaseModelOutput,
     QuestionAnsweringModelOutput,
     SequenceClassifierOutput,
     TokenClassifierOutput,
 )
-from transformers.modeling_utils import PreTrainedModel
-from transformers.utils import logging
-
-from ...activations import ACT2FN
-from ...utils import add_start_docstrings, add_start_docstrings_to_model_forward, replace_return_docstrings
+from ...modeling_utils import PreTrainedModel
+from ...pytorch_utils import apply_chunking_to_forward
+from ...utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from .configuration_layoutlmv3 import LayoutLMv3Config
 
 
@@ -67,7 +66,7 @@ LAYOUTLMV3_MODEL_INPUTS_DOCSTRING = r"""
             Note that `sequence_length = token_sequence_length + patch_sequence_length + 1` where `1` is for [CLS]
             token. See `pixel_values` for `patch_sequence_length`.
 
-            Indices can be obtained using [`LayoutLMv3Tokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
 
             [What are input IDs?](../glossary#input-ids)
@@ -140,7 +139,7 @@ LAYOUTLMV3_DOWNSTREAM_INPUTS_DOCSTRING = r"""
         input_ids (`torch.LongTensor` of shape `({0})`):
             Indices of input sequence tokens in the vocabulary.
 
-            Indices can be obtained using [`LayoutLMv3Tokenizer`]. See [`PreTrainedTokenizer.encode`] and
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.encode`] and
             [`PreTrainedTokenizer.__call__`] for details.
 
             [What are input IDs?](../glossary#input-ids)
@@ -246,7 +245,9 @@ class LayoutLMv3TextEmbeddings(nn.Module):
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
-        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
+        self.register_buffer(
+            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
+        )
 
         self.padding_idx = config.pad_token_id
         self.position_embeddings = nn.Embedding(
@@ -751,8 +752,6 @@ class LayoutLMv3Output(nn.Module):
     LAYOUTLMV3_START_DOCSTRING,
 )
 class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"position_ids"]
-
     def __init__(self, config):
         super().__init__(config)
         self.config = config
@@ -847,18 +846,18 @@ class LayoutLMv3Model(LayoutLMv3PreTrainedModel):
     @replace_return_docstrings(output_type=BaseModelOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
-        input_ids=None,
-        bbox=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        pixel_values=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-    ):
+        input_ids: Optional[torch.LongTensor] = None,
+        bbox: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+    ) -> Union[Tuple, BaseModelOutput]:
         r"""
         Returns:
 
@@ -1039,9 +1038,6 @@ class LayoutLMv3ClassificationHead(nn.Module):
     LAYOUTLMV3_START_DOCSTRING,
 )
 class LayoutLMv3ForTokenClassification(LayoutLMv3PreTrainedModel):
-    _keys_to_ignore_on_load_unexpected = [r"pooler"]
-    _keys_to_ignore_on_load_missing = [r"position_ids"]
-
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
@@ -1061,19 +1057,19 @@ class LayoutLMv3ForTokenClassification(LayoutLMv3PreTrainedModel):
     @replace_return_docstrings(output_type=TokenClassifierOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
-        input_ids=None,
-        bbox=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        pixel_values=None,
-    ):
+        input_ids: Optional[torch.LongTensor] = None,
+        bbox: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        pixel_values: Optional[torch.LongTensor] = None,
+    ) -> Union[Tuple, TokenClassifierOutput]:
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the token classification loss. Indices should be in `[0, ..., config.num_labels - 1]`.
@@ -1154,9 +1150,6 @@ class LayoutLMv3ForTokenClassification(LayoutLMv3PreTrainedModel):
     LAYOUTLMV3_START_DOCSTRING,
 )
 class LayoutLMv3ForQuestionAnswering(LayoutLMv3PreTrainedModel):
-    _keys_to_ignore_on_load_unexpected = [r"pooler"]
-    _keys_to_ignore_on_load_missing = [r"position_ids"]
-
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
@@ -1172,20 +1165,20 @@ class LayoutLMv3ForQuestionAnswering(LayoutLMv3PreTrainedModel):
     @replace_return_docstrings(output_type=QuestionAnsweringModelOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        start_positions=None,
-        end_positions=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        bbox=None,
-        pixel_values=None,
-    ):
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        start_positions: Optional[torch.LongTensor] = None,
+        end_positions: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        bbox: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.LongTensor] = None,
+    ) -> Union[Tuple, QuestionAnsweringModelOutput]:
         r"""
         start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
             Labels for position (index) of the start of the labelled span for computing the token classification loss.
@@ -1287,8 +1280,6 @@ class LayoutLMv3ForQuestionAnswering(LayoutLMv3PreTrainedModel):
     LAYOUTLMV3_START_DOCSTRING,
 )
 class LayoutLMv3ForSequenceClassification(LayoutLMv3PreTrainedModel):
-    _keys_to_ignore_on_load_missing = [r"position_ids"]
-
     def __init__(self, config):
         super().__init__(config)
         self.num_labels = config.num_labels
@@ -1304,19 +1295,19 @@ class LayoutLMv3ForSequenceClassification(LayoutLMv3PreTrainedModel):
     @replace_return_docstrings(output_type=SequenceClassifierOutput, config_class=_CONFIG_FOR_DOC)
     def forward(
         self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        head_mask=None,
-        inputs_embeds=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
-        bbox=None,
-        pixel_values=None,
-    ):
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        token_type_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        labels: Optional[torch.LongTensor] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        bbox: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.LongTensor] = None,
+    ) -> Union[Tuple, SequenceClassifierOutput]:
         """
         Returns:
 

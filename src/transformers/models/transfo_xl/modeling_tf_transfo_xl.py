@@ -17,6 +17,8 @@
  TF 2.0 Transformer XL model.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -47,7 +49,6 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "transfo-xl-wt103"
 _CONFIG_FOR_DOC = "TransfoXLConfig"
-_TOKENIZER_FOR_DOC = "TransfoXLTokenizer"
 
 TF_TRANSFO_XL_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "transfo-xl-wt103",
@@ -129,7 +130,7 @@ class TFRelPartialLearnableMultiHeadAttn(tf.keras.layers.Layer):
         layer_norm_epsilon=1e-5,
         init_std=0.02,
         output_attentions=False,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
@@ -282,7 +283,7 @@ class TFRelPartialLearnableDecoderLayer(tf.keras.layers.Layer):
         layer_norm_epsilon=1e-5,
         init_std=0.02,
         output_attentions=False,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
 
@@ -542,17 +543,16 @@ class TFTransfoXLMainLayer(tf.keras.layers.Layer):
     @unpack_inputs
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        mems: Optional[List[tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        input_ids: TFModelInputType | None = None,
+        mems: List[tf.Tensor] | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        labels: np.ndarray | tf.Tensor | None = None,
         training: bool = False,
     ):
-
         # the original code for Transformer-XL used shapes [len, bsz] but we want a unified interface in the library
         # so we transpose here from shape [bsz, len] to shape [len, bsz]
         if input_ids is not None and inputs_embeds is not None:
@@ -588,35 +588,19 @@ class TFTransfoXLMainLayer(tf.keras.layers.Layer):
         klen = mlen + qlen
 
         # Compute decoder attention mask
-
-        # ::: PyTorch masking code for reference :::
-        # if self.same_length:
-        #     all_ones = word_emb.new_ones((qlen, klen), dtype=torch.uint8)
-        #     mask_len = klen - self.mem_len
-        #     if mask_len > 0:
-        #         mask_shift_len = qlen - mask_len
-        #     else:
-        #         mask_shift_len = qlen
-        #     dec_attn_mask = (torch.triu(all_ones, 1+mlen)
-        #             + torch.tril(all_ones, -mask_shift_len))[:, :, None] # -1
-        # else:
-        #     dec_attn_mask = torch.triu(
-        #         word_emb.new_ones((qlen, klen), dtype=torch.uint8), diagonal=1+mlen)[:,:,None]
-
-        # TensorFlow version
-        dec_attn_mask = 1 - tf.linalg.band_part(
-            tf.ones([qlen, klen], dtype=tf.int32), -1, mlen
-        )  # (q, q): diagonal with 1's
+        all_ones = tf.ones([qlen, klen], dtype=tf.int32)
+        upper_mask = 1 - tf.linalg.band_part(tf.ones([qlen, klen], dtype=tf.int32), -1, mlen)
         if self.same_length:
             mask_len = klen - self.mem_len
-            if mask_len > 0:
-                mask_shift_len = qlen - mask_len
-            else:
-                mask_shift_len = qlen
-            if mask_shift_len >= 1:
-                dec_attn_mask += 1 - tf.linalg.band_part(tf.ones([qlen, klen], dtype=tf.int32), mask_shift_len - 1, -1)
-            else:
-                dec_attn_mask += tf.linalg.band_part(tf.ones([qlen, klen], dtype=tf.int32), -1, -mask_shift_len)
+            mask_shift_len = qlen - tf.nn.relu(mask_len)  # Lazy clamping of negatives to zero
+
+            # Use an indicator variable instead of a conditional to keep the compiler happy
+            lower_mask = tf.linalg.band_part(all_ones, -1, 0) - (
+                tf.linalg.band_part(all_ones, mask_shift_len - 1, 0) * tf.cast(mask_shift_len != 0, tf.int32)
+            )
+            dec_attn_mask = upper_mask + lower_mask
+        else:
+            dec_attn_mask = upper_mask
 
         hids = []
         attentions = [] if output_attentions else None
@@ -684,18 +668,6 @@ class TFTransfoXLPreTrainedModel(TFPreTrainedModel):
     config_class = TransfoXLConfig
     base_model_prefix = "transformer"
 
-    @tf.function(
-        input_signature=[
-            {
-                "input_ids": tf.TensorSpec((None, None), tf.int64, name="input_ids"),
-            }
-        ]
-    )
-    def serving(self, inputs):
-        output = self.call(inputs)
-
-        return self.serving_output(output)
-
 
 @dataclass
 class TFTransfoXLModelOutput(ModelOutput):
@@ -724,8 +696,8 @@ class TFTransfoXLModelOutput(ModelOutput):
 
     last_hidden_state: tf.Tensor = None
     mems: List[tf.Tensor] = None
-    hidden_states: Optional[Tuple[tf.Tensor]] = None
-    attentions: Optional[Tuple[tf.Tensor]] = None
+    hidden_states: Tuple[tf.Tensor] | None = None
+    attentions: Tuple[tf.Tensor] | None = None
 
 
 @dataclass
@@ -757,8 +729,8 @@ class TFTransfoXLLMHeadModelOutput(ModelOutput):
 
     prediction_scores: tf.Tensor = None
     mems: List[tf.Tensor] = None
-    hidden_states: Optional[Tuple[tf.Tensor]] = None
-    attentions: Optional[Tuple[tf.Tensor]] = None
+    hidden_states: Tuple[tf.Tensor] | None = None
+    attentions: Tuple[tf.Tensor] | None = None
 
 
 @dataclass
@@ -788,11 +760,11 @@ class TFTransfoXLSequenceClassifierOutputWithPast(ModelOutput):
             heads.
     """
 
-    loss: Optional[tf.Tensor] = None
+    loss: tf.Tensor | None = None
     logits: tf.Tensor = None
     mems: List[tf.Tensor] = None
-    hidden_states: Optional[Tuple[tf.Tensor]] = None
-    attentions: Optional[Tuple[tf.Tensor]] = None
+    hidden_states: Tuple[tf.Tensor] | None = None
+    attentions: Tuple[tf.Tensor] | None = None
 
 
 TRANSFO_XL_START_DOCSTRING = r"""
@@ -842,7 +814,7 @@ TRANSFO_XL_INPUTS_DOCSTRING = r"""
         input_ids (`tf.Tensor` or `Numpy array` of shape `(batch_size, sequence_length)`):
             Indices of input sequence tokens in the vocabulary.
 
-            Indices can be obtained using [`BertTokenizer`]. See [`PreTrainedTokenizer.__call__`] and
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.__call__`] and
             [`PreTrainedTokenizer.encode`] for details.
 
             [What are input IDs?](../glossary#input-ids)
@@ -888,17 +860,16 @@ class TFTransfoXLModel(TFTransfoXLPreTrainedModel):
     @unpack_inputs
     @add_start_docstrings_to_model_forward(TRANSFO_XL_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFTransfoXLModelOutput,
         config_class=_CONFIG_FOR_DOC,
     )
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        mems: Optional[List[tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        input_ids: TFModelInputType | None = None,
+        mems: List[tf.Tensor] | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -916,17 +887,6 @@ class TFTransfoXLModel(TFTransfoXLPreTrainedModel):
         )
 
         return outputs
-
-    def serving_output(self, output):
-        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
-        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
-
-        return TFTransfoXLModelOutput(
-            last_hidden_state=output.last_hidden_state,
-            mems=tf.convert_to_tensor(output.mems),
-            hidden_states=hs,
-            attentions=attns,
-        )
 
 
 @add_start_docstrings(
@@ -968,21 +928,20 @@ class TFTransfoXLLMHeadModel(TFTransfoXLPreTrainedModel):
     @unpack_inputs
     @add_start_docstrings_to_model_forward(TRANSFO_XL_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFTransfoXLLMHeadModelOutput,
         config_class=_CONFIG_FOR_DOC,
     )
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        mems: Optional[List[tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        input_ids: TFModelInputType | None = None,
+        mems: List[tf.Tensor] | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        labels: np.ndarray | tf.Tensor | None = None,
         training: bool = False,
     ):
         if input_ids is not None:
@@ -1017,31 +976,16 @@ class TFTransfoXLLMHeadModel(TFTransfoXLPreTrainedModel):
             attentions=transformer_outputs.attentions,
         )
 
-    def serving_output(self, output):
-        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
-        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
-
-        return TFTransfoXLLMHeadModelOutput(
-            prediction_scores=output.prediction_scores,
-            mems=tf.convert_to_tensor(output.mems),
-            hidden_states=hs,
-            attentions=attns,
-        )
-
-    def prepare_inputs_for_generation(self, input_ids, past=None, **model_kwargs):
+    def prepare_inputs_for_generation(self, input_ids, past_key_values=None, **model_kwargs):
         inputs = {}
 
         # if past is defined in model kwargs then use it for faster decoding
-        if past:
+        if past_key_values:
             input_ids = tf.expand_dims(input_ids[:, -1], axis=-1)
         else:
             input_ids = input_ids
 
         return inputs
-
-    @staticmethod
-    def _reorder_cache(mems: List[tf.Tensor], beam_idx: tf.Tensor) -> List[tf.Tensor]:
-        return [tf.gather(layer_past, beam_idx, axis=1) for layer_past in mems]
 
 
 @add_start_docstrings(
@@ -1072,26 +1016,30 @@ class TFTransfoXLForSequenceClassification(TFTransfoXLPreTrainedModel, TFSequenc
         self.transformer = TFTransfoXLMainLayer(config, name="transformer")
 
     def get_output_embeddings(self):
+        # Remove after transformers v4.32. Fix this model's `test_model_common_attributes` test too.
+        logger.warning(
+            "Sequence classification models do not have output embeddings. `.get_output_embeddings` will be removed "
+            "in transformers v4.32."
+        )
         return self.transformer.word_emb
 
     @unpack_inputs
     @add_start_docstrings_to_model_forward(TRANSFO_XL_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFTransfoXLSequenceClassifierOutputWithPast,
         config_class=_CONFIG_FOR_DOC,
     )
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        mems: Optional[List[tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        input_ids: TFModelInputType | None = None,
+        mems: List[tf.Tensor] | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        labels: np.ndarray | tf.Tensor | None = None,
         training: Optional[bool] = False,
     ) -> Union[Tuple, TFTransfoXLSequenceClassifierOutputWithPast]:
         r"""
@@ -1118,16 +1066,10 @@ class TFTransfoXLForSequenceClassification(TFTransfoXLPreTrainedModel, TFSequenc
         else:
             if input_ids is not None:
                 sequence_lengths = (
-                    tf.reduce_sum(
-                        tf.cast(
-                            tf.math.not_equal(input_ids, self.config.pad_token_id),
-                            dtype=input_ids.dtype,
-                        ),
-                        -1,
-                        keepdims=False,
-                    )
+                    tf.argmax(tf.cast(tf.math.equal(input_ids, self.config.pad_token_id), input_ids.dtype), axis=-1)
                     - 1
                 )
+                sequence_lengths = tf.where(sequence_lengths >= 0, sequence_lengths, input_ids.shape[-1] - 1)
                 in_logits = tf.gather(logits, sequence_lengths, batch_dims=1, axis=1)
             else:
                 sequence_lengths = -1
@@ -1163,12 +1105,4 @@ class TFTransfoXLForSequenceClassification(TFTransfoXLPreTrainedModel, TFSequenc
             mems=transformer_outputs.mems,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
-        )
-
-    def serving_output(self, output):
-        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
-        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
-
-        return TFTransfoXLSequenceClassifierOutputWithPast(
-            logits=output.logits, mems=tf.convert_to_tensor(output.mems), hidden_states=hs, attentions=attns
         )

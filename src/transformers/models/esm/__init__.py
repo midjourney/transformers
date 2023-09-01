@@ -1,7 +1,3 @@
-# flake8: noqa
-# There's no way to ignore "F401 '...' imported but unused" warnings in this
-# module, but to preserve other warnings. So, don't check this module at all.
-
 # Copyright 2022 Facebook and The HuggingFace Team. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +13,7 @@
 # limitations under the License.
 from typing import TYPE_CHECKING
 
-from ...utils import OptionalDependencyNotAvailable, _LazyModule, is_torch_available
+from ...utils import OptionalDependencyNotAvailable, _LazyModule, is_tf_available, is_torch_available
 
 
 _import_structure = {
@@ -39,7 +35,22 @@ else:
         "EsmModel",
         "EsmPreTrainedModel",
     ]
+    _import_structure["modeling_esmfold"] = ["EsmForProteinFolding", "EsmFoldPreTrainedModel"]
 
+try:
+    if not is_tf_available():
+        raise OptionalDependencyNotAvailable()
+except OptionalDependencyNotAvailable:
+    pass
+else:
+    _import_structure["modeling_tf_esm"] = [
+        "TF_ESM_PRETRAINED_MODEL_ARCHIVE_LIST",
+        "TFEsmForMaskedLM",
+        "TFEsmForSequenceClassification",
+        "TFEsmForTokenClassification",
+        "TFEsmModel",
+        "TFEsmPreTrainedModel",
+    ]
 
 if TYPE_CHECKING:
     from .configuration_esm import ESM_PRETRAINED_CONFIG_ARCHIVE_MAP, EsmConfig
@@ -58,6 +69,22 @@ if TYPE_CHECKING:
             EsmForTokenClassification,
             EsmModel,
             EsmPreTrainedModel,
+        )
+        from .modeling_esmfold import EsmFoldPreTrainedModel, EsmForProteinFolding
+
+    try:
+        if not is_tf_available():
+            raise OptionalDependencyNotAvailable()
+    except OptionalDependencyNotAvailable:
+        pass
+    else:
+        from .modeling_tf_esm import (
+            TF_ESM_PRETRAINED_MODEL_ARCHIVE_LIST,
+            TFEsmForMaskedLM,
+            TFEsmForSequenceClassification,
+            TFEsmForTokenClassification,
+            TFEsmModel,
+            TFEsmPreTrainedModel,
         )
 
 

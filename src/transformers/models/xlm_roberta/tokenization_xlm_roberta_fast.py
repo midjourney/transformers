@@ -147,7 +147,7 @@ class XLMRobertaTokenizerFast(PreTrainedTokenizerFast):
         unk_token="<unk>",
         pad_token="<pad>",
         mask_token="<mask>",
-        **kwargs
+        **kwargs,
     ):
         # Mask token behave like a normal word, i.e. include the space before it
         mask_token = AddedToken(mask_token, lstrip=True, rstrip=False) if isinstance(mask_token, str) else mask_token
@@ -166,7 +166,10 @@ class XLMRobertaTokenizerFast(PreTrainedTokenizerFast):
         )
 
         self.vocab_file = vocab_file
-        self.can_save_slow_tokenizer = False if not self.vocab_file else True
+
+    @property
+    def can_save_slow_tokenizer(self) -> bool:
+        return os.path.isfile(self.vocab_file) if self.vocab_file else False
 
     def build_inputs_with_special_tokens(
         self, token_ids_0: List[int], token_ids_1: Optional[List[int]] = None

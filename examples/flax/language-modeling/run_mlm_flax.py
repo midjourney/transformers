@@ -26,6 +26,7 @@ import math
 import os
 import sys
 import time
+import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from itertools import chain
@@ -34,19 +35,19 @@ from itertools import chain
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
-from datasets import load_dataset
-from tqdm import tqdm
-
 import flax
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
+from datasets import load_dataset
 from flax import jax_utils, traverse_util
 from flax.jax_utils import pad_shard_unpad
 from flax.training import train_state
 from flax.training.common_utils import get_metrics, onehot, shard
-from huggingface_hub import Repository
+from huggingface_hub import Repository, create_repo
+from tqdm import tqdm
+
 from transformers import (
     CONFIG_MAPPING,
     FLAX_MODEL_FOR_MASKED_LM_MAPPING,
@@ -59,7 +60,7 @@ from transformers import (
     is_tensorboard_available,
     set_seed,
 )
-from transformers.utils import get_full_repo_name, send_example_telemetry
+from transformers.utils import send_example_telemetry
 
 
 MODEL_CONFIG_CLASSES = list(FLAX_MODEL_FOR_MASKED_LM_MAPPING.keys())
@@ -174,12 +175,28 @@ class ModelArguments:
             )
         },
     )
+    token: str = field(
+        default=None,
+        metadata={
+            "help": (
+                "The token to use as HTTP bearer authorization for remote files. If not specified, will use the token "
+                "generated when running `huggingface-cli login` (stored in `~/.huggingface`)."
+            )
+        },
+    )
     use_auth_token: bool = field(
+        default=None,
+        metadata={
+            "help": "The `use_auth_token` argument is deprecated and will be removed in v4.34. Please use `token`."
+        },
+    )
+    trust_remote_code: bool = field(
         default=False,
         metadata={
             "help": (
-                "Will use the token generated when running `huggingface-cli login` (necessary to use this script "
-                "with private models)."
+                "Whether or not to allow for custom models defined on the Hub in their own modeling files. This option"
+                "should only be set to `True` for repositories you trust and in which you have read the code, as it will"
+                "execute code present on the Hub on your local machine."
             )
         },
     )
@@ -377,6 +394,12 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    if model_args.use_auth_token is not None:
+        warnings.warn("The `use_auth_token` argument is deprecated and will be removed in v4.34.", FutureWarning)
+        if model_args.token is not None:
+            raise ValueError("`token` and `use_auth_token` are both specified. Please set only the argument `token`.")
+        model_args.token = model_args.use_auth_token
+
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_mlm", model_args, data_args, framework="flax")
@@ -410,13 +433,14 @@ def main():
 
     # Handle the repository creation
     if training_args.push_to_hub:
-        if training_args.hub_model_id is None:
-            repo_name = get_full_repo_name(
-                Path(training_args.output_dir).absolute().name, token=training_args.hub_token
-            )
-        else:
-            repo_name = training_args.hub_model_id
-        repo = Repository(training_args.output_dir, clone_from=repo_name)
+        # Retrieve of infer repo_name
+        repo_name = training_args.hub_model_id
+        if repo_name is None:
+            repo_name = Path(training_args.output_dir).absolute().name
+        # Create repo and retrieve repo_id
+        repo_id = create_repo(repo_name, exist_ok=True, token=training_args.hub_token).repo_id
+        # Clone repo locally
+        repo = Repository(training_args.output_dir, clone_from=repo_id, token=training_args.hub_token)
 
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
     # or just provide the name of one of the public datasets available on the hub at https://huggingface.co/datasets/
@@ -433,7 +457,7 @@ def main():
             data_args.dataset_name,
             data_args.dataset_config_name,
             cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=model_args.token,
         )
 
         if "validation" not in datasets.keys():
@@ -442,14 +466,14 @@ def main():
                 data_args.dataset_config_name,
                 split=f"train[:{data_args.validation_split_percentage}%]",
                 cache_dir=model_args.cache_dir,
-                use_auth_token=True if model_args.use_auth_token else None,
+                token=model_args.token,
             )
             datasets["train"] = load_dataset(
                 data_args.dataset_name,
                 data_args.dataset_config_name,
                 split=f"train[{data_args.validation_split_percentage}%:]",
                 cache_dir=model_args.cache_dir,
-                use_auth_token=True if model_args.use_auth_token else None,
+                token=model_args.token,
             )
     else:
         data_files = {}
@@ -464,7 +488,7 @@ def main():
             extension,
             data_files=data_files,
             cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=model_args.token,
         )
 
         if "validation" not in datasets.keys():
@@ -473,14 +497,14 @@ def main():
                 data_files=data_files,
                 split=f"train[:{data_args.validation_split_percentage}%]",
                 cache_dir=model_args.cache_dir,
-                use_auth_token=True if model_args.use_auth_token else None,
+                token=model_args.token,
             )
             datasets["train"] = load_dataset(
                 extension,
                 data_files=data_files,
                 split=f"train[{data_args.validation_split_percentage}%:]",
                 cache_dir=model_args.cache_dir,
-                use_auth_token=True if model_args.use_auth_token else None,
+                token=model_args.token,
             )
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
@@ -494,13 +518,15 @@ def main():
         config = AutoConfig.from_pretrained(
             model_args.config_name,
             cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
         )
     elif model_args.model_name_or_path:
         config = AutoConfig.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
         )
     else:
         config = CONFIG_MAPPING[model_args.model_type]()
@@ -511,14 +537,16 @@ def main():
             model_args.tokenizer_name,
             cache_dir=model_args.cache_dir,
             use_fast=model_args.use_fast_tokenizer,
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
         )
     elif model_args.model_name_or_path:
         tokenizer = AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=model_args.cache_dir,
             use_fast=model_args.use_fast_tokenizer,
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
         )
     else:
         raise ValueError(
@@ -637,13 +665,15 @@ def main():
             config=config,
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
         )
     else:
         model = FlaxAutoModelForMaskedLM.from_config(
             config,
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
+            trust_remote_code=model_args.trust_remote_code,
         )
 
     if training_args.gradient_checkpointing:
@@ -678,14 +708,12 @@ def main():
         flat_params = traverse_util.flatten_dict(params)
         # find out all LayerNorm parameters
         layer_norm_candidates = ["layernorm", "layer_norm", "ln"]
-        layer_norm_named_params = set(
-            [
-                layer[-2:]
-                for layer_norm_name in layer_norm_candidates
-                for layer in flat_params.keys()
-                if layer_norm_name in "".join(layer).lower()
-            ]
-        )
+        layer_norm_named_params = {
+            layer[-2:]
+            for layer_norm_name in layer_norm_candidates
+            for layer in flat_params.keys()
+            if layer_norm_name in "".join(layer).lower()
+        }
         flat_mask = {path: (path[-1] != "bias" and path[-2:] not in layer_norm_named_params) for path in flat_params}
         return traverse_util.unflatten_dict(flat_mask)
 
@@ -723,18 +751,25 @@ def main():
             loss = optax.softmax_cross_entropy(logits, onehot(labels, logits.shape[-1])) * label_mask
 
             # take average
-            loss = loss.sum() / label_mask.sum()
+            loss = loss.sum()
+            num_labels = label_mask.sum()
 
-            return loss
+            return loss, num_labels
 
-        grad_fn = jax.value_and_grad(loss_fn)
-        loss, grad = grad_fn(state.params)
-        grad = jax.lax.pmean(grad, "batch")
+        grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, num_labels), grad = grad_fn(state.params)
+        num_labels = jax.lax.psum(num_labels, "batch")
+
+        # true loss = total loss / total samples
+        loss = jax.lax.psum(loss, "batch")
+        loss = jax.tree_util.tree_map(lambda x: x / num_labels, loss)
+
+        # true grad = total grad / total samples
+        grad = jax.lax.psum(grad, "batch")
+        grad = jax.tree_util.tree_map(lambda x: x / num_labels, grad)
         new_state = state.apply_gradients(grads=grad)
 
-        metrics = jax.lax.pmean(
-            {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}, axis_name="batch"
-        )
+        metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}
 
         return new_state, metrics, new_dropout_rng
 

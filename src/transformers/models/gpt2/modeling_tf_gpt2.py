@@ -15,6 +15,8 @@
 # limitations under the License.
 """ TF 2.0 OpenAI GPT-2 model."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -34,14 +36,12 @@ from ...modeling_tf_utils import (
     TFPreTrainedModel,
     TFSequenceClassificationLoss,
     TFSequenceSummary,
-    TFSharedEmbeddings,
     get_initializer,
     keras_serializable,
     unpack_inputs,
 )
-from ...tf_utils import shape_list, stable_softmax
+from ...tf_utils import check_embeddings_within_bounds, shape_list, stable_softmax
 from ...utils import (
-    DUMMY_INPUTS,
     ModelOutput,
     add_code_sample_docstrings,
     add_start_docstrings,
@@ -56,7 +56,6 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "gpt2"
 _CONFIG_FOR_DOC = "GPT2Config"
-_TOKENIZER_FOR_DOC = "GPT2Tokenizer"
 
 TF_GPT2_PRETRAINED_MODEL_ARCHIVE_LIST = [
     "gpt2",
@@ -164,7 +163,6 @@ class TFAttention(tf.keras.layers.Layer):
         output_attentions,
         training=False,
     ):
-
         if encoder_hidden_states is not None:
             if not hasattr(self, "q_attn"):
                 raise ValueError(
@@ -184,7 +182,7 @@ class TFAttention(tf.keras.layers.Layer):
         key = self.split_heads(key)
         value = self.split_heads(value)
         if layer_past is not None:
-            past_key, past_value = tf.unstack(layer_past, axis=0)
+            past_key, past_value = tf.unstack(layer_past, axis=0, num=2)
             key = tf.concat([past_key, key], axis=-2)
             value = tf.concat([past_value, value], axis=-2)
 
@@ -231,7 +229,6 @@ class TFBlock(tf.keras.layers.Layer):
         self.ln_2 = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_epsilon, name="ln_2")
 
         if config.add_cross_attention:
-
             self.crossattention = TFAttention(nx, config, scale, name="crossattention", is_cross_attention=True)
             self.ln_cross_attn = tf.keras.layers.LayerNormalization(
                 epsilon=config.layer_norm_epsilon, name="ln_cross_attn"
@@ -314,34 +311,31 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
         self.return_dict = config.use_return_dict
 
         self.num_hidden_layers = config.n_layer
-        self.vocab_size = config.vocab_size
         self.n_embd = config.n_embd
         self.n_positions = config.n_positions
         self.initializer_range = config.initializer_range
 
-        self.wte = TFSharedEmbeddings(
-            config.vocab_size, config.hidden_size, initializer_range=config.initializer_range, name="wte"
+        self.wte = tf.keras.layers.Embedding(
+            input_dim=config.vocab_size,
+            output_dim=config.hidden_size,
+            embeddings_initializer=get_initializer(config.initializer_range),
+            name="wte",
+        )
+        self.wpe = tf.keras.layers.Embedding(
+            input_dim=config.n_positions,
+            output_dim=config.n_embd,
+            embeddings_initializer=get_initializer(config.initializer_range),
+            name="wpe",
         )
         self.drop = tf.keras.layers.Dropout(config.embd_pdrop)
         self.h = [TFBlock(config, scale=True, name=f"h_._{i}") for i in range(config.n_layer)]
         self.ln_f = tf.keras.layers.LayerNormalization(epsilon=config.layer_norm_epsilon, name="ln_f")
 
-    def build(self, input_shape):
-        with tf.name_scope("wpe"):
-            self.wpe = self.add_weight(
-                name="embeddings",
-                shape=[self.n_positions, self.n_embd],
-                initializer=get_initializer(self.initializer_range),
-            )
-
-        super().build(input_shape)
-
     def get_input_embeddings(self):
         return self.wte
 
-    def set_input_embeddings(self, value):
-        self.wte.weight = value
-        self.wte.vocab_size = shape_list(value)[0]
+    def set_input_embeddings(self, new_embeddings):
+        self.wte = new_embeddings
 
     def _prune_heads(self, heads_to_prune):
         """
@@ -352,22 +346,21 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
     @unpack_inputs
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        past: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        encoder_hidden_states: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        encoder_attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        input_ids: TFModelInputType | None = None,
+        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        encoder_hidden_states: np.ndarray | tf.Tensor | None = None,
+        encoder_attention_mask: np.ndarray | tf.Tensor | None = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         training: Optional[bool] = False,
     ) -> Union[TFBaseModelOutputWithPastAndCrossAttentions, Tuple[tf.Tensor]]:
-
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
         elif input_ids is not None:
@@ -378,11 +371,11 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
         else:
             raise ValueError("You have to specify either input_ids or inputs_embeds")
 
-        if past is None:
+        if past_key_values is None:
             past_length = 0
-            past = [None] * len(self.h)
+            past_key_values = [None] * len(self.h)
         else:
-            past_length = shape_list(past[0][0])[-2]
+            past_length = shape_list(past_key_values[0][0])[-2]
 
         if position_ids is None:
             position_ids = tf.expand_dims(tf.range(past_length, input_shape[-1] + past_length), axis=0)
@@ -442,23 +435,14 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
         position_ids = tf.reshape(position_ids, [-1, shape_list(position_ids)[-1]])
 
         if inputs_embeds is None:
-            # Note: tf.gather, on which the embedding layer is based, won't check positive out of bound
-            # indices on GPU, returning zeros instead. This is a dangerous silent behavior.
-            tf.debugging.assert_less(
-                input_ids,
-                tf.cast(self.vocab_size, dtype=input_ids.dtype),
-                message=(
-                    "input_ids must be smaller than the embedding layer's input dimension (got"
-                    f" {tf.math.reduce_max(input_ids)} >= {self.vocab_size})"
-                ),
-            )
-            inputs_embeds = self.wte(input_ids, mode="embedding")
+            check_embeddings_within_bounds(input_ids, self.config.vocab_size)
+            inputs_embeds = self.wte(input_ids)
 
-        position_embeds = tf.gather(self.wpe, position_ids)
+        position_embeds = self.wpe(position_ids)
 
         if token_type_ids is not None:
             token_type_ids = tf.reshape(token_type_ids, [-1, shape_list(token_type_ids)[-1]])
-            token_type_embeds = self.wte(token_type_ids, mode="embedding")
+            token_type_embeds = self.wte(token_type_ids)
         else:
             token_type_embeds = tf.constant(0.0)
 
@@ -473,7 +457,7 @@ class TFGPT2MainLayer(tf.keras.layers.Layer):
         all_attentions = () if output_attentions else None
         all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
         all_hidden_states = () if output_hidden_states else None
-        for i, (block, layer_past) in enumerate(zip(self.h, past)):
+        for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (tf.reshape(hidden_states, output_shape),)
 
@@ -537,37 +521,6 @@ class TFGPT2PreTrainedModel(TFPreTrainedModel):
     # names with a '.' represents the authorized unexpected/missing layers when a TF model is loaded from a PT model
     _keys_to_ignore_on_load_unexpected = [r"h.\d+.attn.bias", r"h.\d+.crossattention.bias"]
 
-    @property
-    def dummy_inputs(self):
-        """
-        Dummy inputs to build the network.
-
-        Returns:
-            `Dict[str, tf.Tensor]`: The dummy inputs.
-        """
-        dummy = {"input_ids": tf.constant(DUMMY_INPUTS)}
-        # Add `encoder_hidden_states` to make the cross-attention layers' weights initialized
-        if self.config.add_cross_attention:
-            batch_size, seq_len = tf.constant(DUMMY_INPUTS).shape
-            shape = (batch_size, seq_len) + (self.config.hidden_size,)
-            h = tf.random.uniform(shape=shape)
-            dummy["encoder_hidden_states"] = h
-
-        return dummy
-
-    @tf.function(
-        input_signature=[
-            {
-                "input_ids": tf.TensorSpec((None, None), tf.int64, name="input_ids"),
-                "attention_mask": tf.TensorSpec((None, None), tf.int64, name="attention_mask"),
-            }
-        ]
-    )
-    def serving(self, inputs):
-        output = self.call(inputs)
-
-        return self.serving_output(output)
-
 
 @dataclass
 class TFGPT2DoubleHeadsModelOutput(ModelOutput):
@@ -600,9 +553,9 @@ class TFGPT2DoubleHeadsModelOutput(ModelOutput):
 
     logits: tf.Tensor = None
     mc_logits: tf.Tensor = None
-    past_key_values: Optional[List[tf.Tensor]] = None
-    hidden_states: Optional[Tuple[tf.Tensor]] = None
-    attentions: Optional[Tuple[tf.Tensor]] = None
+    past_key_values: List[tf.Tensor] | None = None
+    hidden_states: Tuple[tf.Tensor] | None = None
+    attentions: Tuple[tf.Tensor] | None = None
 
 
 GPT2_START_DOCSTRING = r"""
@@ -650,19 +603,20 @@ GPT2_START_DOCSTRING = r"""
 GPT2_INPUTS_DOCSTRING = r"""
     Args:
         input_ids (`Numpy array` or `tf.Tensor` of shape `(batch_size, input_ids_length)`):
-            `input_ids_length` = `sequence_length` if `past` is `None` else `past[0].shape[-2]` (`sequence_length` of
-            input past key value states). Indices of input sequence tokens in the vocabulary.
+            `input_ids_length` = `sequence_length` if `past_key_values` is `None` else `past_key_values[0].shape[-2]`
+            (`sequence_length` of input past key value states). Indices of input sequence tokens in the vocabulary.
 
-            If `past` is used, only input IDs that do not have their past calculated should be passed as `input_ids`.
+            If `past_key_values` is used, only input IDs that do not have their past calculated should be passed as
+            `input_ids`.
 
-            Indices can be obtained using [`GPT2Tokenizer`]. See [`PreTrainedTokenizer.__call__`] and
+            Indices can be obtained using [`AutoTokenizer`]. See [`PreTrainedTokenizer.__call__`] and
             [`PreTrainedTokenizer.encode`] for details.
 
             [What are input IDs?](../glossary#input-ids)
-        past (`List[tf.Tensor]` of length `config.n_layers`):
+        past_key_values (`List[tf.Tensor]` of length `config.n_layers`):
             Contains pre-computed hidden-states (key and values in the attention blocks) as computed by the model (see
-            `past` output below). Can be used to speed up sequential decoding. The token ids which have their past
-            given to this model should not be passed as input ids as they have already been computed.
+            `past_key_values` output below). Can be used to speed up sequential decoding. The token ids which have
+            their past given to this model should not be passed as input ids as they have already been computed.
         attention_mask (`tf.Tensor` or `Numpy array` of shape `(batch_size, sequence_length)`, *optional*):
             Mask to avoid performing attention on padding token indices. Mask values selected in `[0, 1]`:
 
@@ -726,22 +680,21 @@ class TFGPT2Model(TFGPT2PreTrainedModel):
     @unpack_inputs
     @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFBaseModelOutputWithPastAndCrossAttentions,
         config_class=_CONFIG_FOR_DOC,
     )
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        past: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        encoder_hidden_states: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        encoder_attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        input_ids: TFModelInputType | None = None,
+        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        encoder_hidden_states: np.ndarray | tf.Tensor | None = None,
+        encoder_attention_mask: np.ndarray | tf.Tensor | None = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -759,7 +712,7 @@ class TFGPT2Model(TFGPT2PreTrainedModel):
             - 1 for tokens that are **not masked**,
             - 0 for tokens that are **masked**.
 
-        past (`Tuple[Tuple[tf.Tensor]]` of length `config.n_layers`)
+        past_key_values (`Tuple[Tuple[tf.Tensor]]` of length `config.n_layers`)
             contains precomputed key and value hidden states of the attention blocks. Can be used to speed up decoding.
             If `past` are used, the user can optionally input only the last `decoder_input_ids` (those that don't have
             their past key value states given to this model) of shape `(batch_size, 1)` instead of all
@@ -771,7 +724,7 @@ class TFGPT2Model(TFGPT2PreTrainedModel):
 
         outputs = self.transformer(
             input_ids=input_ids,
-            past=past,
+            past_key_values=past_key_values,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
@@ -787,26 +740,6 @@ class TFGPT2Model(TFGPT2PreTrainedModel):
         )
 
         return outputs
-
-    def serving_output(self, output):
-        pkv = tf.convert_to_tensor(output.past_key_values) if self.config.use_cache else None
-        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
-        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
-        cross_attns = (
-            tf.convert_to_tensor(output.cross_attentions)
-            if self.config.output_attentions
-            and self.config.add_cross_attention
-            and output.cross_attentions is not None
-            else None
-        )
-
-        return TFBaseModelOutputWithPastAndCrossAttentions(
-            last_hidden_state=output.last_hidden_state,
-            past_key_values=pkv,
-            hidden_states=hs,
-            attentions=attns,
-            cross_attentions=cross_attns,
-        )
 
 
 @add_start_docstrings(
@@ -827,10 +760,10 @@ class TFGPT2LMHeadModel(TFGPT2PreTrainedModel, TFCausalLanguageModelingLoss):
     def set_output_embeddings(self, value):
         self.set_input_embeddings(value)
 
-    def prepare_inputs_for_generation(self, inputs, past=None, use_cache=None, **kwargs):
+    def prepare_inputs_for_generation(self, inputs, past_key_values=None, use_cache=None, **kwargs):
         token_type_ids = kwargs.get("token_type_ids", None)
         # only last token for inputs_ids if past is defined in kwargs
-        if past:
+        if past_key_values:
             inputs = tf.expand_dims(inputs[:, -1], -1)
             if token_type_ids is not None:
                 token_type_ids = tf.expand_dims(token_type_ids[:, -1], -1)
@@ -840,14 +773,14 @@ class TFGPT2LMHeadModel(TFGPT2PreTrainedModel, TFCausalLanguageModelingLoss):
 
         if attention_mask is not None and position_ids is None:
             position_ids = tf.math.cumsum(attention_mask, axis=-1, exclusive=True)
-            if past:
+            if past_key_values:
                 position_ids = tf.expand_dims(position_ids[:, -1], -1)
 
         return {
             "input_ids": inputs,
             "attention_mask": attention_mask,
             "position_ids": position_ids,
-            "past": past,
+            "past_key_values": past_key_values,
             "use_cache": use_cache,
             "token_type_ids": token_type_ids,
         }
@@ -855,27 +788,26 @@ class TFGPT2LMHeadModel(TFGPT2PreTrainedModel, TFCausalLanguageModelingLoss):
     @unpack_inputs
     @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint=_CHECKPOINT_FOR_DOC,
         output_type=TFCausalLMOutputWithCrossAttentions,
         config_class=_CONFIG_FOR_DOC,
     )
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        past: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        encoder_hidden_states: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        encoder_attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        input_ids: TFModelInputType | None = None,
+        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        encoder_hidden_states: np.ndarray | tf.Tensor | None = None,
+        encoder_attention_mask: np.ndarray | tf.Tensor | None = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        labels: np.ndarray | tf.Tensor | None = None,
         training: Optional[bool] = False,
     ) -> Union[TFCausalLMOutputWithCrossAttentions, Tuple[tf.Tensor]]:
         r"""
@@ -889,7 +821,7 @@ class TFGPT2LMHeadModel(TFGPT2PreTrainedModel, TFCausalLanguageModelingLoss):
             - 1 for tokens that are **not masked**,
             - 0 for tokens that are **masked**.
 
-        past (`Tuple[Tuple[tf.Tensor]]` of length `config.n_layers`)
+        past_key_values (`Tuple[Tuple[tf.Tensor]]` of length `config.n_layers`)
             contains precomputed key and value hidden states of the attention blocks. Can be used to speed up decoding.
             If `past` are used, the user can optionally input only the last `decoder_input_ids` (those that don't have
             their past key value states given to this model) of shape `(batch_size, 1)` instead of all
@@ -904,7 +836,7 @@ class TFGPT2LMHeadModel(TFGPT2PreTrainedModel, TFCausalLanguageModelingLoss):
 
         transformer_outputs = self.transformer(
             input_ids=input_ids,
-            past=past,
+            past_key_values=past_key_values,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
@@ -919,7 +851,7 @@ class TFGPT2LMHeadModel(TFGPT2PreTrainedModel, TFCausalLanguageModelingLoss):
             training=training,
         )
         hidden_states = transformer_outputs[0]
-        logits = self.transformer.wte(hidden_states, mode="linear")
+        logits = tf.matmul(hidden_states, self.transformer.wte.weights, transpose_b=True)
 
         loss = None
         if labels is not None:
@@ -939,22 +871,6 @@ class TFGPT2LMHeadModel(TFGPT2PreTrainedModel, TFCausalLanguageModelingLoss):
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
             cross_attentions=transformer_outputs.cross_attentions,
-        )
-
-    def serving_output(self, output):
-        pkv = tf.convert_to_tensor(output.past_key_values) if self.config.use_cache else None
-        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
-        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
-        cross_attns = (
-            tf.convert_to_tensor(output.cross_attentions)
-            if self.config.output_attentions
-            and self.config.add_cross_attention
-            and output.cross_attentions is not None
-            else None
-        )
-
-        return TFCausalLMOutputWithCrossAttentions(
-            logits=output.logits, past_key_values=pkv, hidden_states=hs, attentions=attns, cross_attentions=cross_attns
         )
 
 
@@ -981,14 +897,14 @@ class TFGPT2DoubleHeadsModel(TFGPT2PreTrainedModel):
     @replace_return_docstrings(output_type=TFGPT2DoubleHeadsModelOutput, config_class=_CONFIG_FOR_DOC)
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        past: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        mc_token_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        input_ids: TFModelInputType | None = None,
+        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
+        mc_token_ids: np.ndarray | tf.Tensor | None = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -1006,9 +922,9 @@ class TFGPT2DoubleHeadsModel(TFGPT2PreTrainedModel):
 
         ```python
         >>> import tensorflow as tf
-        >>> from transformers import GPT2Tokenizer, TFGPT2DoubleHeadsModel
+        >>> from transformers import AutoTokenizer, TFGPT2DoubleHeadsModel
 
-        >>> tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
+        >>> tokenizer = AutoTokenizer.from_pretrained("gpt2")
         >>> model = TFGPT2DoubleHeadsModel.from_pretrained("gpt2")
 
         >>> # Add a [CLS] to the vocabulary (we should train it also!)
@@ -1041,7 +957,7 @@ class TFGPT2DoubleHeadsModel(TFGPT2PreTrainedModel):
         flat_position_ids = tf.reshape(position_ids, (-1, seq_length)) if position_ids is not None else None
         transformer_outputs = self.transformer(
             input_ids=flat_input_ids,
-            past=past,
+            past_key_values=past_key_values,
             attention_mask=flat_attention_mask,
             token_type_ids=flat_token_type_ids,
             position_ids=flat_position_ids,
@@ -1057,7 +973,13 @@ class TFGPT2DoubleHeadsModel(TFGPT2PreTrainedModel):
         )
         hidden_states = transformer_outputs[0]
         hidden_states = tf.reshape(hidden_states, input_shapes + shape_list(hidden_states)[-1:])
-        lm_logits = self.transformer.wte(hidden_states, mode="linear")
+        if return_dict and output_hidden_states:
+            # We do this to match the slightly odd PT behaviour - the final hidden state is reshaped to rank 4 when the
+            # input is rank 3, but all other hidden states remain at rank-3 (with the first 2 dims merged)
+            all_hidden_states = transformer_outputs.hidden_states[:-1] + (hidden_states,)
+        else:
+            all_hidden_states = None
+        lm_logits = tf.matmul(hidden_states, self.transformer.wte.weights, transpose_b=True)
         mc_logits = self.multiple_choice_head(hidden_states, mc_token_ids, training=training)
         mc_logits = tf.squeeze(mc_logits, axis=-1)
 
@@ -1068,36 +990,17 @@ class TFGPT2DoubleHeadsModel(TFGPT2PreTrainedModel):
             logits=lm_logits,
             mc_logits=mc_logits,
             past_key_values=transformer_outputs.past_key_values,
-            hidden_states=transformer_outputs.hidden_states,
+            hidden_states=all_hidden_states,
             attentions=transformer_outputs.attentions,
         )
 
-    @tf.function(
-        input_signature=[
-            {
-                "input_ids": tf.TensorSpec((None, None, None), tf.int32, name="input_ids"),
-                "attention_mask": tf.TensorSpec((None, None, None), tf.int32, name="attention_mask"),
-                "mc_token_ids": tf.TensorSpec((None, None), tf.int32, name="mc_token_ids"),
-            }
-        ]
-    )
-    def serving(self, inputs):
-        output = self.call(inputs)
-
-        return self.serving_output(output)
-
-    def serving_output(self, output):
-        pkv = tf.convert_to_tensor(output.past_key_values) if self.config.use_cache else None
-        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
-        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
-
-        return TFGPT2DoubleHeadsModelOutput(
-            logits=output.logits,
-            mc_logits=output.mc_logits,
-            past_key_values=pkv,
-            hidden_states=hs,
-            attentions=attns,
-        )
+    @property
+    def input_signature(self):
+        return {
+            "input_ids": tf.TensorSpec((None, None, None), tf.int32, name="input_ids"),
+            "attention_mask": tf.TensorSpec((None, None, None), tf.int32, name="attention_mask"),
+            "mc_token_ids": tf.TensorSpec((None, None), tf.int32, name="mc_token_ids"),
+        }
 
 
 @add_start_docstrings(
@@ -1130,25 +1033,24 @@ class TFGPT2ForSequenceClassification(TFGPT2PreTrainedModel, TFSequenceClassific
     @unpack_inputs
     @add_start_docstrings_to_model_forward(GPT2_INPUTS_DOCSTRING)
     @add_code_sample_docstrings(
-        processor_class=_TOKENIZER_FOR_DOC,
         checkpoint="microsoft/DialogRPT-updown",
         output_type=TFSequenceClassifierOutputWithPast,
         config_class=_CONFIG_FOR_DOC,
     )
     def call(
         self,
-        input_ids: Optional[TFModelInputType] = None,
-        past: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
-        attention_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        token_type_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        position_ids: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        head_mask: Optional[Union[np.ndarray, tf.Tensor]] = None,
-        inputs_embeds: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        input_ids: TFModelInputType | None = None,
+        past_key_values: Optional[Tuple[Tuple[Union[np.ndarray, tf.Tensor]]]] = None,
+        attention_mask: np.ndarray | tf.Tensor | None = None,
+        token_type_ids: np.ndarray | tf.Tensor | None = None,
+        position_ids: np.ndarray | tf.Tensor | None = None,
+        head_mask: np.ndarray | tf.Tensor | None = None,
+        inputs_embeds: np.ndarray | tf.Tensor | None = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        labels: Optional[Union[np.ndarray, tf.Tensor]] = None,
+        labels: np.ndarray | tf.Tensor | None = None,
         training: Optional[bool] = False,
     ) -> Union[TFSequenceClassifierOutputWithPast, Tuple[tf.Tensor]]:
         r"""
@@ -1158,7 +1060,7 @@ class TFGPT2ForSequenceClassification(TFGPT2PreTrainedModel, TFSequenceClassific
         """
         transformer_outputs = self.transformer(
             input_ids=input_ids,
-            past=past,
+            past_key_values=past_key_values,
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
@@ -1180,16 +1082,10 @@ class TFGPT2ForSequenceClassification(TFGPT2PreTrainedModel, TFSequenceClassific
         else:
             if input_ids is not None:
                 sequence_lengths = (
-                    tf.reduce_sum(
-                        tf.cast(
-                            tf.math.not_equal(input_ids, self.config.pad_token_id),
-                            dtype=input_ids.dtype,
-                        ),
-                        -1,
-                        keepdims=False,
-                    )
+                    tf.argmax(tf.cast(tf.math.equal(input_ids, self.config.pad_token_id), input_ids.dtype), axis=-1)
                     - 1
                 )
+                sequence_lengths = tf.where(sequence_lengths >= 0, sequence_lengths, input_ids.shape[-1] - 1)
                 in_logits = tf.gather(logits, sequence_lengths, batch_dims=1, axis=1)
             else:
                 sequence_lengths = -1
@@ -1220,13 +1116,4 @@ class TFGPT2ForSequenceClassification(TFGPT2PreTrainedModel, TFSequenceClassific
             past_key_values=transformer_outputs.past_key_values,
             hidden_states=transformer_outputs.hidden_states,
             attentions=transformer_outputs.attentions,
-        )
-
-    def serving_output(self, output):
-        pkv = tf.convert_to_tensor(output.past_key_values) if self.config.use_cache else None
-        hs = tf.convert_to_tensor(output.hidden_states) if self.config.output_hidden_states else None
-        attns = tf.convert_to_tensor(output.attentions) if self.config.output_attentions else None
-
-        return TFSequenceClassifierOutputWithPast(
-            logits=output.logits, past_key_values=pkv, hidden_states=hs, attentions=attns
         )

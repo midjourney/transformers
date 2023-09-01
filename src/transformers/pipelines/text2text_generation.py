@@ -9,10 +9,10 @@ from .base import PIPELINE_INIT_ARGS, Pipeline
 if is_tf_available():
     import tensorflow as tf
 
-    from ..models.auto.modeling_tf_auto import TF_MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING
+    from ..models.auto.modeling_tf_auto import TF_MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING_NAMES
 
 if is_torch_available():
-    from ..models.auto.modeling_auto import MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING
+    from ..models.auto.modeling_auto import MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING_NAMES
 
 logger = logging.get_logger(__name__)
 
@@ -27,12 +27,29 @@ class Text2TextGenerationPipeline(Pipeline):
     """
     Pipeline for text to text generation using seq2seq models.
 
+    Example:
+
+    ```python
+    >>> from transformers import pipeline
+
+    >>> generator = pipeline(model="mrm8488/t5-base-finetuned-question-generation-ap")
+    >>> generator(
+    ...     "answer: Manuel context: Manuel has created RuPERTa-base with the support of HF-Transformers and Google"
+    ... )
+    [{'generated_text': 'question: Who created the RuPERTa-base?'}]
+    ```
+
+    Learn more about the basics of using a pipeline in the [pipeline tutorial](../pipeline_tutorial)
+
+
     This Text2TextGenerationPipeline pipeline can currently be loaded from [`pipeline`] using the following task
     identifier: `"text2text-generation"`.
 
     The models that this pipeline can use are models that have been fine-tuned on a translation task. See the
     up-to-date list of available models on
-    [huggingface.co/models](https://huggingface.co/models?filter=text2text-generation).
+    [huggingface.co/models](https://huggingface.co/models?filter=text2text-generation). For a list of available
+    parameters, see the [following
+    documentation](https://huggingface.co/docs/transformers/en/main_classes/text_generation#transformers.generation.GenerationMixin.generate)
 
     Usage:
 
@@ -48,9 +65,9 @@ class Text2TextGenerationPipeline(Pipeline):
         super().__init__(*args, **kwargs)
 
         self.check_model_type(
-            TF_MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING
+            TF_MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING_NAMES
             if self.framework == "tf"
-            else MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING
+            else MODEL_FOR_SEQ_TO_SEQ_CAUSAL_LM_MAPPING_NAMES
         )
 
     def _sanitize_parameters(
@@ -61,7 +78,7 @@ class Text2TextGenerationPipeline(Pipeline):
         clean_up_tokenization_spaces=None,
         truncation=None,
         stop_sequence=None,
-        **generate_kwargs
+        **generate_kwargs,
     ):
         preprocess_params = {}
         if truncation is not None:
@@ -202,7 +219,9 @@ class SummarizationPipeline(Text2TextGenerationPipeline):
 
     The models that this pipeline can use are models that have been fine-tuned on a summarization task, which is
     currently, '*bart-large-cnn*', '*t5-small*', '*t5-base*', '*t5-large*', '*t5-3b*', '*t5-11b*'. See the up-to-date
-    list of available models on [huggingface.co/models](https://huggingface.co/models?filter=summarization).
+    list of available models on [huggingface.co/models](https://huggingface.co/models?filter=summarization). For a list
+    of available parameters, see the [following
+    documentation](https://huggingface.co/docs/transformers/en/main_classes/text_generation#transformers.generation.GenerationMixin.generate)
 
     Usage:
 
@@ -254,7 +273,8 @@ class SummarizationPipeline(Text2TextGenerationPipeline):
 
         if input_length < max_length:
             logger.warning(
-                f"Your max_length is set to {max_length}, but you input_length is only {input_length}. You might "
+                f"Your max_length is set to {max_length}, but your input_length is only {input_length}. Since this is "
+                "a summarization task, where outputs shorter than the input are typically wanted, you might "
                 f"consider decreasing max_length manually, e.g. summarizer('...', max_length={input_length//2})"
             )
 
@@ -269,6 +289,8 @@ class TranslationPipeline(Text2TextGenerationPipeline):
 
     The models that this pipeline can use are models that have been fine-tuned on a translation task. See the
     up-to-date list of available models on [huggingface.co/models](https://huggingface.co/models?filter=translation).
+    For a list of available parameters, see the [following
+    documentation](https://huggingface.co/docs/transformers/en/main_classes/text_generation#transformers.generation.GenerationMixin.generate)
 
     Usage:
 

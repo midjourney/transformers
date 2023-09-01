@@ -109,7 +109,7 @@ class RemBertTokenizer(PreTrainedTokenizer):
         pad_token="[PAD]",
         cls_token="[CLS]",
         mask_token="[MASK]",
-        **kwargs
+        **kwargs,
     ):
         super().__init__(
             do_lower_case=do_lower_case,
@@ -219,7 +219,7 @@ class RemBertTokenizer(PreTrainedTokenizer):
                     "You should not supply a second sequence if the provided sequence of "
                     "ids is already formatted with special tokens for the model."
                 )
-            return list(map(lambda x: 1 if x in [self.sep_token_id, self.cls_token_id] else 0, token_ids_0))
+            return [1 if x in [self.sep_token_id, self.cls_token_id] else 0 for x in token_ids_0]
 
         if token_ids_1 is not None:
             return [1] + ([0] * len(token_ids_0)) + [1] + ([0] * len(token_ids_1)) + [1]
@@ -263,7 +263,11 @@ class RemBertTokenizer(PreTrainedTokenizer):
             save_directory, (filename_prefix + "-" if filename_prefix else "") + VOCAB_FILES_NAMES["vocab_file"]
         )
 
-        if os.path.abspath(self.vocab_file) != os.path.abspath(out_vocab_file):
+        if os.path.abspath(self.vocab_file) != os.path.abspath(out_vocab_file) and os.path.isfile(self.vocab_file):
             copyfile(self.vocab_file, out_vocab_file)
+        elif not os.path.isfile(self.vocab_file):
+            with open(out_vocab_file, "wb") as fi:
+                content_spiece_model = self.sp_model.serialized_model_proto()
+                fi.write(content_spiece_model)
 
         return (out_vocab_file,)

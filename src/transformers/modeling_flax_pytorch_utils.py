@@ -19,13 +19,13 @@ import os
 from pickle import UnpicklingError
 from typing import Dict, Tuple
 
-import numpy as np
-
 import jax
 import jax.numpy as jnp
-import transformers
+import numpy as np
 from flax.serialization import from_bytes
 from flax.traverse_util import flatten_dict, unflatten_dict
+
+import transformers
 
 from .utils import logging
 
@@ -76,11 +76,21 @@ def rename_key_and_reshape_tensor(
 
     def is_key_or_prefix_key_in_dict(key: Tuple[str]) -> bool:
         """Checks if `key` of `(prefix,) + key` is in random_flax_state_dict"""
-        return len(set(random_flax_state_dict) & set([key, (model_prefix,) + key])) > 0
+        return len(set(random_flax_state_dict) & {key, (model_prefix,) + key}) > 0
 
     # layer norm
     renamed_pt_tuple_key = pt_tuple_key[:-1] + ("scale",)
     if pt_tuple_key[-1] in ["weight", "gamma"] and is_key_or_prefix_key_in_dict(renamed_pt_tuple_key):
+        return renamed_pt_tuple_key, pt_tensor
+
+    # batch norm layer mean
+    renamed_pt_tuple_key = pt_tuple_key[:-1] + ("mean",)
+    if pt_tuple_key[-1] == "running_mean" and not is_key_or_prefix_key_in_dict(pt_tuple_key):
+        return renamed_pt_tuple_key, pt_tensor
+
+    # batch norm layer var
+    renamed_pt_tuple_key = pt_tuple_key[:-1] + ("var",)
+    if pt_tuple_key[-1] == "running_var" and not is_key_or_prefix_key_in_dict(pt_tuple_key):
         return renamed_pt_tuple_key, pt_tensor
 
     # embedding
@@ -110,28 +120,64 @@ def rename_key_and_reshape_tensor(
     if pt_tuple_key[-1] == "beta":
         return renamed_pt_tuple_key, pt_tensor
 
+    # New `weight_norm` from https://github.com/huggingface/transformers/pull/24030
+    name = None
+    if pt_tuple_key[-3::2] == ("parametrizations", "original0"):
+        name = pt_tuple_key[-2] + "_g"
+    elif pt_tuple_key[-3::2] == ("parametrizations", "original1"):
+        name = pt_tuple_key[-2] + "_v"
+    if name is not None:
+        renamed_pt_tuple_key = pt_tuple_key[:-3] + (name,)
+        return renamed_pt_tuple_key, pt_tensor
+
     return pt_tuple_key, pt_tensor
 
 
 def convert_pytorch_state_dict_to_flax(pt_state_dict, flax_model):
     # convert pytorch tensor to numpy
-    pt_state_dict = {k: v.numpy() for k, v in pt_state_dict.items()}
+    # numpy currently does not support bfloat16, need to go over float32 in this case to not lose precision
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        logger.error(
+            "Loading a PyTorch model in Flax, requires both PyTorch and Flax to be installed. Please see"
+            " https://pytorch.org/ and https://flax.readthedocs.io/en/latest/installation.html for installation"
+            " instructions."
+        )
+        raise
+
+    weight_dtypes = {k: v.dtype for k, v in pt_state_dict.items()}
+    pt_state_dict = {
+        k: v.numpy() if not v.dtype == torch.bfloat16 else v.float().numpy() for k, v in pt_state_dict.items()
+    }
 
     model_prefix = flax_model.base_model_prefix
-    random_flax_state_dict = flatten_dict(flax_model.params)
+
+    # use params dict if the model contains batch norm layers
+    if "params" in flax_model.params:
+        flax_model_params = flax_model.params["params"]
+    else:
+        flax_model_params = flax_model.params
+    random_flax_state_dict = flatten_dict(flax_model_params)
+
+    # add batch_stats keys,values to dict
+    if "batch_stats" in flax_model.params:
+        flax_batch_stats = flatten_dict(flax_model.params["batch_stats"])
+        random_flax_state_dict.update(flax_batch_stats)
+
     flax_state_dict = {}
 
-    load_model_with_head_into_base_model = (model_prefix not in flax_model.params) and (
-        model_prefix in set([k.split(".")[0] for k in pt_state_dict.keys()])
+    load_model_with_head_into_base_model = (model_prefix not in flax_model_params) and (
+        model_prefix in {k.split(".")[0] for k in pt_state_dict.keys()}
     )
-    load_base_model_into_model_with_head = (model_prefix in flax_model.params) and (
-        model_prefix not in set([k.split(".")[0] for k in pt_state_dict.keys()])
+    load_base_model_into_model_with_head = (model_prefix in flax_model_params) and (
+        model_prefix not in {k.split(".")[0] for k in pt_state_dict.keys()}
     )
 
     # Need to change some parameters name to match Flax names
     for pt_key, pt_tensor in pt_state_dict.items():
-
         pt_tuple_key = tuple(pt_key.split("."))
+        is_bfloat_16 = weight_dtypes[pt_key] == torch.bfloat16
 
         # remove base model prefix if necessary
         has_base_model_prefix = pt_tuple_key[0] == model_prefix
@@ -155,8 +201,26 @@ def convert_pytorch_state_dict_to_flax(pt_state_dict, flax_model):
                     f"{random_flax_state_dict[flax_key].shape}, but is {flax_tensor.shape}."
                 )
 
-        # also add unexpected weight so that warning is thrown
-        flax_state_dict[flax_key] = jnp.asarray(flax_tensor)
+        # add batch stats if the model contains batchnorm layers
+        if "batch_stats" in flax_model.params:
+            if "mean" in flax_key[-1] or "var" in flax_key[-1]:
+                flax_state_dict[("batch_stats",) + flax_key] = jnp.asarray(flax_tensor)
+                continue
+            # remove num_batches_tracked key
+            if "num_batches_tracked" in flax_key[-1]:
+                flax_state_dict.pop(flax_key, None)
+                continue
+
+            # also add unexpected weight so that warning is thrown
+            flax_state_dict[("params",) + flax_key] = (
+                jnp.asarray(flax_tensor) if not is_bfloat_16 else jnp.asarray(flax_tensor, dtype=jnp.bfloat16)
+            )
+
+        else:
+            # also add unexpected weight so that warning is thrown
+            flax_state_dict[flax_key] = (
+                jnp.asarray(flax_tensor) if not is_bfloat_16 else jnp.asarray(flax_tensor, dtype=jnp.bfloat16)
+            )
 
     return unflatten_dict(flax_state_dict)
 
@@ -177,17 +241,25 @@ def convert_pytorch_sharded_state_dict_to_flax(shard_filenames, flax_model):
         pt_state_dict = {k: v.numpy() for k, v in pt_state_dict.items()}
 
         model_prefix = flax_model.base_model_prefix
-        random_flax_state_dict = flatten_dict(flax_model.params)
 
-        load_model_with_head_into_base_model = (model_prefix not in flax_model.params) and (
-            model_prefix in set([k.split(".")[0] for k in pt_state_dict.keys()])
+        # use params dict if the model contains batch norm layers and then add batch_stats keys,values to dict
+        if "batch_stats" in flax_model.params:
+            flax_model_params = flax_model.params["params"]
+
+            random_flax_state_dict = flatten_dict(flax_model_params)
+            random_flax_state_dict.update(flatten_dict(flax_model.params["batch_stats"]))
+        else:
+            flax_model_params = flax_model.params
+            random_flax_state_dict = flatten_dict(flax_model_params)
+
+        load_model_with_head_into_base_model = (model_prefix not in flax_model_params) and (
+            model_prefix in {k.split(".")[0] for k in pt_state_dict.keys()}
         )
-        load_base_model_into_model_with_head = (model_prefix in flax_model.params) and (
-            model_prefix not in set([k.split(".")[0] for k in pt_state_dict.keys()])
+        load_base_model_into_model_with_head = (model_prefix in flax_model_params) and (
+            model_prefix not in {k.split(".")[0] for k in pt_state_dict.keys()}
         )
         # Need to change some parameters name to match Flax names
         for pt_key, pt_tensor in pt_state_dict.items():
-
             pt_tuple_key = tuple(pt_key.split("."))
 
             # remove base model prefix if necessary
@@ -211,8 +283,25 @@ def convert_pytorch_sharded_state_dict_to_flax(shard_filenames, flax_model):
                         f"{random_flax_state_dict[flax_key].shape}, but is {flax_tensor.shape}."
                     )
 
-            # also add unexpected weight so that warning is thrown
-            flax_state_dict[flax_key] = jnp.asarray(flax_tensor)
+            # add batch stats if the model contains batchnorm layers
+            if "batch_stats" in flax_model.params:
+                if "mean" in flax_key[-1]:
+                    flax_state_dict[("batch_stats",) + flax_key] = jnp.asarray(flax_tensor)
+                    continue
+                if "var" in flax_key[-1]:
+                    flax_state_dict[("batch_stats",) + flax_key] = jnp.asarray(flax_tensor)
+                    continue
+                # remove num_batches_tracked key
+                if "num_batches_tracked" in flax_key[-1]:
+                    flax_state_dict.pop(flax_key, None)
+                    continue
+
+                # also add unexpected weight so that warning is thrown
+                flax_state_dict[("params",) + flax_key] = jnp.asarray(flax_tensor)
+
+            else:
+                # also add unexpected weight so that warning is thrown
+                flax_state_dict[flax_key] = jnp.asarray(flax_tensor)
     return unflatten_dict(flax_state_dict)
 
 
@@ -269,10 +358,10 @@ def load_flax_weights_in_pytorch_model(pt_model, flax_state):
     pt_model_dict = pt_model.state_dict()
 
     load_model_with_head_into_base_model = (pt_model.base_model_prefix in flax_state) and (
-        pt_model.base_model_prefix not in set([k.split(".")[0] for k in pt_model_dict.keys()])
+        pt_model.base_model_prefix not in {k.split(".")[0] for k in pt_model_dict.keys()}
     )
     load_base_model_into_model_with_head = (pt_model.base_model_prefix not in flax_state) and (
-        pt_model.base_model_prefix in set([k.split(".")[0] for k in pt_model_dict.keys()])
+        pt_model.base_model_prefix in {k.split(".")[0] for k in pt_model_dict.keys()}
     )
 
     # keep track of unexpected & missing keys
@@ -301,7 +390,34 @@ def load_flax_weights_in_pytorch_model(pt_model, flax_state):
         elif flax_key_tuple[-1] in ["scale", "embedding"]:
             flax_key_tuple = flax_key_tuple[:-1] + ("weight",)
 
-        flax_key = ".".join(flax_key_tuple)
+        # adding batch stats from flax batch norm to pt
+        elif "mean" in flax_key_tuple[-1]:
+            flax_key_tuple = flax_key_tuple[:-1] + ("running_mean",)
+        elif "var" in flax_key_tuple[-1]:
+            flax_key_tuple = flax_key_tuple[:-1] + ("running_var",)
+
+        if "batch_stats" in flax_state:
+            flax_key = ".".join(flax_key_tuple[1:])  # Remove the params/batch_stats header
+        else:
+            flax_key = ".".join(flax_key_tuple)
+
+        # We also need to look at `pt_model_dict` and see if there are keys requiring further transformation.
+        special_pt_names = {}
+        # New `weight_norm` from https://github.com/huggingface/transformers/pull/24030
+        for key in pt_model_dict:
+            key_components = key.split(".")
+            name = None
+            if key_components[-3::2] == ["parametrizations", "original0"]:
+                name = key_components[-2] + "_g"
+            elif key_components[-3::2] == ["parametrizations", "original1"]:
+                name = key_components[-2] + "_v"
+            if name is not None:
+                key_components = key_components[:-3] + [name]
+                key_to_check = ".".join(key_components)
+                special_pt_names[key_to_check] = key
+
+        if flax_key in special_pt_names:
+            flax_key = special_pt_names[flax_key]
 
         if flax_key in pt_model_dict:
             if flax_tensor.shape != pt_model_dict[flax_key].shape:

@@ -30,6 +30,7 @@ from .dynamic_module_utils import custom_object_save
 from .utils import (
     CONFIG_NAME,
     PushToHubMixin,
+    add_model_info_to_auto_map,
     cached_file,
     copy_func,
     download_url,
@@ -118,7 +119,7 @@ class PretrainedConfig(PushToHubMixin):
 
         max_length (`int`, *optional*, defaults to 20):
             Maximum length that will be used by default in the `generate` method of the model.
-        min_length (`int`, *optional*, defaults to 10):
+        min_length (`int`, *optional*, defaults to 0):
             Minimum length that will be used by default in the `generate` method of the model.
         do_sample (`bool`, *optional*, defaults to `False`):
             Flag that will be used by default in the `generate` method of the model. Whether or not to use sampling ;
@@ -135,7 +136,7 @@ class PretrainedConfig(PushToHubMixin):
         diversity_penalty (`float`, *optional*, defaults to 0.0):
             Value to control diversity for group beam search. that will be used by default in the `generate` method of
             the model. 0 means no diversity penalty. The higher the penalty, the more diverse are the outputs.
-        temperature (`float`, *optional*, defaults to 1):
+        temperature (`float`, *optional*, defaults to 1.0):
             The value used to module the next token probabilities that will be used by default in the `generate` method
             of the model. Must be strictly positive.
         top_k (`int`, *optional*, defaults to 50):
@@ -144,6 +145,12 @@ class PretrainedConfig(PushToHubMixin):
         top_p (`float`, *optional*, defaults to 1):
             Value that will be used by default in the `generate` method of the model for `top_p`. If set to float < 1,
             only the most probable tokens with probabilities that add up to `top_p` or higher are kept for generation.
+        typical_p (`float`, *optional*, defaults to 1):
+            Local typicality measures how similar the conditional probability of predicting a target token next is to
+            the expected conditional probability of predicting a random token next, given the partial text already
+            generated. If set to float < 1, the smallest set of the most locally typical tokens with probabilities that
+            add up to `typical_p` or higher are kept for generation. See [this
+            paper](https://arxiv.org/pdf/2202.00666.pdf) for more details.
         repetition_penalty (`float`, *optional*, defaults to 1):
             Parameter for repetition penalty that will be used by default in the `generate` method of the model. 1.0
             means no penalty.
@@ -307,14 +314,18 @@ class PretrainedConfig(PushToHubMixin):
         self.finetuning_task = kwargs.pop("finetuning_task", None)
         self.id2label = kwargs.pop("id2label", None)
         self.label2id = kwargs.pop("label2id", None)
+        if self.label2id is not None and not isinstance(self.label2id, dict):
+            raise ValueError("Argument label2id should be a dictionary.")
         if self.id2label is not None:
+            if not isinstance(self.id2label, dict):
+                raise ValueError("Argument id2label should be a dictionary.")
             num_labels = kwargs.pop("num_labels", None)
             if num_labels is not None and len(self.id2label) != num_labels:
                 logger.warning(
                     f"You passed along `num_labels={num_labels}` with an incompatible id to label map: "
                     f"{self.id2label}. The number of labels wil be overwritten to {self.num_labels}."
                 )
-            self.id2label = dict((int(key), value) for key, value in self.id2label.items())
+            self.id2label = {int(key): value for key, value in self.id2label.items()}
             # Keys are always strings in JSON so convert ids to int here.
         else:
             self.num_labels = kwargs.pop("num_labels", 2)
@@ -421,9 +432,11 @@ class PretrainedConfig(PushToHubMixin):
                 Whether or not to push your model to the Hugging Face model hub after saving it. You can specify the
                 repository you want to push to with `repo_id` (will default to the name of `save_directory` in your
                 namespace).
-            kwargs:
+            kwargs (`Dict[str, Any]`, *optional*):
                 Additional key word arguments passed along to the [`~utils.PushToHubMixin.push_to_hub`] method.
         """
+        self._set_token_in_kwargs(kwargs)
+
         if os.path.isfile(save_directory):
             raise AssertionError(f"Provided path ({save_directory}) should be a directory, not a file")
 
@@ -432,7 +445,7 @@ class PretrainedConfig(PushToHubMixin):
         if push_to_hub:
             commit_message = kwargs.pop("commit_message", None)
             repo_id = kwargs.pop("repo_id", save_directory.split(os.path.sep)[-1])
-            repo_id, token = self._create_repo(repo_id, **kwargs)
+            repo_id = self._create_repo(repo_id, **kwargs)
             files_timestamps = self._get_files_timestamps(save_directory)
 
         # If we have a custom config, we copy the file defining it in the folder and set the attributes so it can be
@@ -448,11 +461,50 @@ class PretrainedConfig(PushToHubMixin):
 
         if push_to_hub:
             self._upload_modified_files(
-                save_directory, repo_id, files_timestamps, commit_message=commit_message, token=token
+                save_directory,
+                repo_id,
+                files_timestamps,
+                commit_message=commit_message,
+                token=kwargs.get("token"),
             )
 
+    @staticmethod
+    def _set_token_in_kwargs(kwargs, token=None):
+        """Temporary method to deal with `token` and `use_auth_token`.
+
+        This method is to avoid apply the same changes in all model config classes that overwrite `from_pretrained`.
+
+        Need to clean up `use_auth_token` in a follow PR.
+        """
+        # Some model config classes like CLIP define their own `from_pretrained` without the new argument `token` yet.
+        if token is None:
+            token = kwargs.pop("token", None)
+        use_auth_token = kwargs.pop("use_auth_token", None)
+
+        if use_auth_token is not None:
+            warnings.warn(
+                "The `use_auth_token` argument is deprecated and will be removed in v5 of Transformers.", FutureWarning
+            )
+            if token is not None:
+                raise ValueError(
+                    "`token` and `use_auth_token` are both specified. Please set only the argument `token`."
+                )
+            token = use_auth_token
+
+        if token is not None:
+            kwargs["token"] = token
+
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path: Union[str, os.PathLike], **kwargs) -> "PretrainedConfig":
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path: Union[str, os.PathLike],
+        cache_dir: Optional[Union[str, os.PathLike]] = None,
+        force_download: bool = False,
+        local_files_only: bool = False,
+        token: Optional[Union[str, bool]] = None,
+        revision: str = "main",
+        **kwargs,
+    ) -> "PretrainedConfig":
         r"""
         Instantiate a [`PretrainedConfig`] (or a derived class) from a pretrained model configuration.
 
@@ -478,13 +530,20 @@ class PretrainedConfig(PushToHubMixin):
             proxies (`Dict[str, str]`, *optional*):
                 A dictionary of proxy servers to use by protocol or endpoint, e.g., `{'http': 'foo.bar:3128',
                 'http://hostname': 'foo.bar:4012'}.` The proxies are used on each request.
-            use_auth_token (`str` or *bool*, *optional*):
-                The token to use as HTTP bearer authorization for remote files. If `True`, will use the token generated
-                when running `huggingface-cli login` (stored in `~/.huggingface`).
+            token (`str` or `bool`, *optional*):
+                The token to use as HTTP bearer authorization for remote files. If `True`, or not specified, will use
+                the token generated when running `huggingface-cli login` (stored in `~/.huggingface`).
             revision (`str`, *optional*, defaults to `"main"`):
                 The specific model version to use. It can be a branch name, a tag name, or a commit id, since we use a
                 git-based system for storing models and other artifacts on huggingface.co, so `revision` can be any
                 identifier allowed by git.
+
+                <Tip>
+
+                To test a pull request you made on the Hub, you can pass `revision="refs/pr/<pr_number>".
+
+                </Tip>
+
             return_unused_kwargs (`bool`, *optional*, defaults to `False`):
                 If `False`, then this function returns just the final configuration object.
 
@@ -498,12 +557,6 @@ class PretrainedConfig(PushToHubMixin):
                 The values in kwargs of any keys which are configuration attributes will be used to override the loaded
                 values. Behavior concerning key/value pairs whose keys are *not* configuration attributes is controlled
                 by the `return_unused_kwargs` keyword parameter.
-
-        <Tip>
-
-        Passing `use_auth_token=True` is required when you want to use a private model.
-
-        </Tip>
 
         Returns:
             [`PretrainedConfig`]: The configuration object instantiated from this pretrained model.
@@ -528,6 +581,13 @@ class PretrainedConfig(PushToHubMixin):
         assert config.output_attentions == True
         assert unused_kwargs == {"foo": False}
         ```"""
+        kwargs["cache_dir"] = cache_dir
+        kwargs["force_download"] = force_download
+        kwargs["local_files_only"] = local_files_only
+        kwargs["revision"] = revision
+
+        cls._set_token_in_kwargs(kwargs, token)
+
         config_dict, kwargs = cls.get_config_dict(pretrained_model_name_or_path, **kwargs)
         if "model_type" in config_dict and hasattr(cls, "model_type") and config_dict["model_type"] != cls.model_type:
             logger.warning(
@@ -553,6 +613,8 @@ class PretrainedConfig(PushToHubMixin):
             `Tuple[Dict, Dict]`: The dictionary(ies) that will be used to instantiate the configuration object.
 
         """
+        cls._set_token_in_kwargs(kwargs)
+
         original_kwargs = copy.deepcopy(kwargs)
         # Get config dict associated with the base config file
         config_dict, kwargs = cls._get_config_dict(pretrained_model_name_or_path, **kwargs)
@@ -576,7 +638,7 @@ class PretrainedConfig(PushToHubMixin):
         force_download = kwargs.pop("force_download", False)
         resume_download = kwargs.pop("resume_download", False)
         proxies = kwargs.pop("proxies", None)
-        use_auth_token = kwargs.pop("use_auth_token", None)
+        token = kwargs.pop("token", None)
         local_files_only = kwargs.pop("local_files_only", False)
         revision = kwargs.pop("revision", None)
         trust_remote_code = kwargs.pop("trust_remote_code", None)
@@ -618,7 +680,7 @@ class PretrainedConfig(PushToHubMixin):
                     proxies=proxies,
                     resume_download=resume_download,
                     local_files_only=local_files_only,
-                    use_auth_token=use_auth_token,
+                    token=token,
                     user_agent=user_agent,
                     revision=revision,
                     subfolder=subfolder,
@@ -652,6 +714,10 @@ class PretrainedConfig(PushToHubMixin):
         else:
             logger.info(f"loading configuration file {configuration_file} from cache at {resolved_config_file}")
 
+        if "auto_map" in config_dict and not is_local:
+            config_dict["auto_map"] = add_model_info_to_auto_map(
+                config_dict["auto_map"], pretrained_model_name_or_path
+            )
         return config_dict, kwargs
 
     @classmethod
@@ -681,7 +747,7 @@ class PretrainedConfig(PushToHubMixin):
         config = cls(**config_dict)
 
         if hasattr(config, "pruned_heads"):
-            config.pruned_heads = dict((int(key), value) for key, value in config.pruned_heads.items())
+            config.pruned_heads = {int(key): value for key, value in config.pruned_heads.items()}
 
         # Update config with kwargs if needed
         if "num_labels" in kwargs and "id2label" in kwargs:
@@ -696,6 +762,10 @@ class PretrainedConfig(PushToHubMixin):
         to_remove = []
         for key, value in kwargs.items():
             if hasattr(config, key):
+                current_attr = getattr(config, key)
+                # To authorize passing a custom subconfig as kwarg in models that have nested configs.
+                if isinstance(current_attr, PretrainedConfig) and isinstance(value, dict):
+                    value = current_attr.__class__(**value)
                 setattr(config, key, value)
                 if key != "torch_dtype":
                     to_remove.append(key)
@@ -731,7 +801,7 @@ class PretrainedConfig(PushToHubMixin):
         return json.loads(text)
 
     def __eq__(self, other):
-        return self.__dict__ == other.__dict__
+        return isinstance(other, PretrainedConfig) and (self.__dict__ == other.__dict__)
 
     def __repr__(self):
         return f"{self.__class__.__name__} {self.to_json_string()}"
@@ -757,12 +827,31 @@ class PretrainedConfig(PushToHubMixin):
         # only serialize values that differ from the default config
         for key, value in config_dict.items():
             if (
+                isinstance(getattr(self, key, None), PretrainedConfig)
+                and key in class_config_dict
+                and isinstance(class_config_dict[key], dict)
+            ):
+                # For nested configs we need to clean the diff recursively
+                diff = recursive_diff_dict(value, class_config_dict[key], config_obj=getattr(self, key, None))
+                if "model_type" in value:
+                    # Needs to be set even if it's not in the diff
+                    diff["model_type"] = value["model_type"]
+                if len(diff) > 0:
+                    serializable_config_dict[key] = diff
+            elif (
                 key not in default_config_dict
                 or key == "transformers_version"
                 or value != default_config_dict[key]
                 or (key in class_config_dict and value != class_config_dict[key])
             ):
                 serializable_config_dict[key] = value
+
+        if hasattr(self, "quantization_config"):
+            serializable_config_dict["quantization_config"] = (
+                self.quantization_config.to_dict()
+                if not isinstance(self.quantization_config, dict)
+                else self.quantization_config
+            )
 
         self.dict_torch_dtype_to_str(serializable_config_dict)
 
@@ -785,6 +874,21 @@ class PretrainedConfig(PushToHubMixin):
 
         # Transformers version when serializing the model
         output["transformers_version"] = __version__
+
+        for key, value in output.items():
+            # Deal with nested configs like CLIP
+            if isinstance(value, PretrainedConfig):
+                value = value.to_dict()
+                del value["transformers_version"]
+
+            output[key] = value
+
+        if hasattr(self, "quantization_config"):
+            output["quantization_config"] = (
+                self.quantization_config.to_dict()
+                if not isinstance(self.quantization_config, dict)
+                else self.quantization_config
+            )
 
         self.dict_torch_dtype_to_str(output)
 
@@ -940,7 +1044,26 @@ def get_configuration_file(configuration_files: List[str]) -> str:
     return configuration_file
 
 
+def recursive_diff_dict(dict_a, dict_b, config_obj=None):
+    """
+    Helper function to recursively take the diff between two nested dictionaries. The resulting diff only contains the
+    values from `dict_a` that are different from values in `dict_b`.
+    """
+    diff = {}
+    default = config_obj.__class__().to_dict() if config_obj is not None else {}
+    for key, value in dict_a.items():
+        obj_value = getattr(config_obj, str(key), None)
+        if isinstance(obj_value, PretrainedConfig) and key in dict_b and isinstance(dict_b[key], dict):
+            diff_value = recursive_diff_dict(value, dict_b[key], config_obj=obj_value)
+            if len(diff_value) > 0:
+                diff[key] = diff_value
+        elif key not in dict_b or value != dict_b[key] or key not in default or value != default[key]:
+            diff[key] = value
+    return diff
+
+
 PretrainedConfig.push_to_hub = copy_func(PretrainedConfig.push_to_hub)
-PretrainedConfig.push_to_hub.__doc__ = PretrainedConfig.push_to_hub.__doc__.format(
-    object="config", object_class="AutoConfig", object_files="configuration file"
-)
+if PretrainedConfig.push_to_hub.__doc__ is not None:
+    PretrainedConfig.push_to_hub.__doc__ = PretrainedConfig.push_to_hub.__doc__.format(
+        object="config", object_class="AutoConfig", object_files="configuration file"
+    )

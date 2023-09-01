@@ -32,9 +32,10 @@ from transformers.testing_utils import (
 )
 from transformers.utils import cached_property
 
-from ...generation.test_generation_utils import GenerationTesterMixin
+from ...generation.test_utils import GenerationTesterMixin
 from ...test_configuration_common import ConfigTester
 from ...test_modeling_common import ModelTesterMixin, _config_zero_init, floats_tensor, ids_tensor
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
@@ -267,9 +268,14 @@ class Speech2TextModelTester:
 
 
 @require_torch
-class Speech2TextModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.TestCase):
+class Speech2TextModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (Speech2TextModel, Speech2TextForConditionalGeneration) if is_torch_available() else ()
     all_generative_model_classes = (Speech2TextForConditionalGeneration,) if is_torch_available() else ()
+    pipeline_model_mapping = (
+        {"automatic-speech-recognition": Speech2TextForConditionalGeneration, "feature-extraction": Speech2TextModel}
+        if is_torch_available()
+        else {}
+    )
     is_encoder_decoder = True
     fx_compatible = True
     test_pruning = False
@@ -706,7 +712,27 @@ class Speech2TextModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.Tes
             model_state_dict = model.state_dict()
             loaded_model_state_dict = loaded_model.state_dict()
 
+            non_persistent_buffers = {}
+            for key in loaded_model_state_dict.keys():
+                if key not in model_state_dict.keys():
+                    non_persistent_buffers[key] = loaded_model_state_dict[key]
+
+            loaded_model_state_dict = {
+                key: value for key, value in loaded_model_state_dict.items() if key not in non_persistent_buffers
+            }
+
             self.assertEqual(set(model_state_dict.keys()), set(loaded_model_state_dict.keys()))
+
+            model_buffers = list(model.buffers())
+            for non_persistent_buffer in non_persistent_buffers.values():
+                found_buffer = False
+                for i, model_buffer in enumerate(model_buffers):
+                    if torch.equal(non_persistent_buffer, model_buffer):
+                        found_buffer = True
+                        break
+
+                self.assertTrue(found_buffer)
+                model_buffers.pop(i)
 
             models_equal = True
             for layer_name, p1 in model_state_dict.items():
@@ -715,6 +741,10 @@ class Speech2TextModelTest(ModelTesterMixin, GenerationTesterMixin, unittest.Tes
                     models_equal = False
 
             self.assertTrue(models_equal)
+
+    def test_pt_tf_model_equivalence(self, allow_missing_keys=True):
+        # Allow missing keys since TF doesn't cache the sinusoidal embeddings in an attribute
+        super().test_pt_tf_model_equivalence(allow_missing_keys=allow_missing_keys)
 
 
 @require_torch

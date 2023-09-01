@@ -22,18 +22,19 @@ import json
 import logging
 import os
 import sys
+import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
 import datasets
+import evaluate
 import nltk  # Here to have a nice missing dependency error message early on
 import numpy as np
 import tensorflow as tf
 from datasets import load_dataset
-
-import evaluate
-import transformers
 from filelock import FileLock
+
+import transformers
 from transformers import (
     AutoConfig,
     AutoTokenizer,
@@ -53,7 +54,7 @@ from transformers.utils.versions import require_version
 
 # region Checking dependencies
 # Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-check_min_version("4.23.0.dev0")
+check_min_version("4.33.0.dev0")
 
 require_version("datasets>=1.8.0", "To fix: pip install -r examples/pytorch/summarization/requirements.txt")
 
@@ -99,12 +100,28 @@ class ModelArguments:
         default="main",
         metadata={"help": "The specific model version to use (can be a branch name, tag name or commit id)."},
     )
+    token: str = field(
+        default=None,
+        metadata={
+            "help": (
+                "The token to use as HTTP bearer authorization for remote files. If not specified, will use the token "
+                "generated when running `huggingface-cli login` (stored in `~/.huggingface`)."
+            )
+        },
+    )
     use_auth_token: bool = field(
+        default=None,
+        metadata={
+            "help": "The `use_auth_token` argument is deprecated and will be removed in v4.34. Please use `token`."
+        },
+    )
+    trust_remote_code: bool = field(
         default=False,
         metadata={
             "help": (
-                "Will use the token generated when running `huggingface-cli login` (necessary to use this script "
-                "with private models)."
+                "Whether or not to allow for custom models defined on the Hub in their own modeling files. This option"
+                "should only be set to `True` for repositories you trust and in which you have read the code, as it will"
+                "execute code present on the Hub on your local machine."
             )
         },
     )
@@ -287,6 +304,12 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    if model_args.use_auth_token is not None:
+        warnings.warn("The `use_auth_token` argument is deprecated and will be removed in v4.34.", FutureWarning)
+        if model_args.token is not None:
+            raise ValueError("`token` and `use_auth_token` are both specified. Please set only the argument `token`.")
+        model_args.token = model_args.use_auth_token
+
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_summarization", model_args, data_args, framework="tensorflow")
@@ -355,7 +378,7 @@ def main():
             data_args.dataset_name,
             data_args.dataset_config_name,
             cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=model_args.token,
         )
     else:
         data_files = {}
@@ -372,7 +395,7 @@ def main():
             extension,
             data_files=data_files,
             cache_dir=model_args.cache_dir,
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=model_args.token,
         )
     # See more about loading any type of standard or custom dataset (from files, python dict, pandas DataFrame, etc) at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
@@ -388,14 +411,16 @@ def main():
         model_args.config_name if model_args.config_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
+        token=model_args.token,
+        trust_remote_code=model_args.trust_remote_code,
     )
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.tokenizer_name if model_args.tokenizer_name else model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
         use_fast=model_args.use_fast_tokenizer,
         revision=model_args.model_revision,
-        use_auth_token=True if model_args.use_auth_token else None,
+        token=model_args.token,
+        trust_remote_code=model_args.trust_remote_code,
     )
 
     prefix = data_args.source_prefix if data_args.source_prefix is not None else ""
@@ -513,10 +538,23 @@ def main():
             config=config,
             cache_dir=model_args.cache_dir,
             revision=model_args.model_revision,
-            use_auth_token=True if model_args.use_auth_token else None,
+            token=model_args.token,
+            trust_remote_code=model_args.trust_remote_code,
         )
 
-        model.resize_token_embeddings(len(tokenizer))
+        # We resize the embeddings only when necessary to avoid index errors. If you are creating a model from scratch
+        # on a small vocab and want a smaller embedding size, remove this test.
+        embeddings = model.get_input_embeddings()
+
+        # Matt: This is a temporary workaround as we transition our models to exclusively using Keras embeddings.
+        #       As soon as the transition is complete, all embeddings should be keras.Embeddings layers, and
+        #       the weights will always be in embeddings.embeddings.
+        if hasattr(embeddings, "embeddings"):
+            embedding_size = embeddings.embeddings.shape[0]
+        else:
+            embedding_size = embeddings.weight.shape[0]
+        if len(tokenizer) > embedding_size:
+            model.resize_token_embeddings(len(tokenizer))
         # endregion
 
         # region Prepare TF Dataset objects
@@ -529,7 +567,7 @@ def main():
             model=model,
             label_pad_token_id=label_pad_token_id,
             pad_to_multiple_of=128,  # Reduce the number of unique shapes for XLA, especially for generation
-            return_tensors="tf",
+            return_tensors="np",
         )
 
         dataset_options = tf.data.Options()
@@ -653,9 +691,8 @@ def main():
             callbacks.append(
                 PushToHubCallback(
                     output_dir=training_args.output_dir,
-                    model_id=push_to_hub_model_id,
-                    organization=training_args.push_to_hub_organization,
-                    token=training_args.push_to_hub_token,
+                    hub_model_id=push_to_hub_model_id,
+                    hub_token=training_args.push_to_hub_token,
                     tokenizer=tokenizer,
                     **model_card_kwargs,
                 )
@@ -663,6 +700,8 @@ def main():
         # endregion
 
         # region Training
+        # Transformers models compute the right loss for their task by default when labels are passed, and will
+        # use this for training unless you specify your own loss function in compile().
         model.compile(optimizer=optimizer, jit_compile=training_args.xla)
         eval_metrics = None
         if training_args.do_train:

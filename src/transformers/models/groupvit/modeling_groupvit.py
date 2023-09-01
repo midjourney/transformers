@@ -64,7 +64,7 @@ def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] 
 
 
 # contrastive loss function, adapted from
-# https://sachinruk.github.io/blog/pytorch/pytorch%20lightning/loss%20function/gpu/2021/03/07/GroupViT.html
+# https://sachinruk.github.io/blog/pytorch/pytorch%20lightning/loss%20function/gpu/2021/03/07/CLIP.html
 def contrastive_loss(logits: torch.Tensor) -> torch.Tensor:
     return nn.functional.cross_entropy(logits, torch.arange(len(logits), device=logits.device))
 
@@ -195,7 +195,6 @@ class GroupViTAssignAttention(nn.Module):
         self.assign_eps = config.assign_eps
 
     def get_attn(self, attn, gumbel=True, hard=True):
-
         if gumbel and self.training:
             attn = gumbel_softmax(attn, dim=-2, hard=hard)
         else:
@@ -451,7 +450,9 @@ class GroupViTTextEmbeddings(nn.Module):
         self.position_embedding = nn.Embedding(config.max_position_embeddings, embed_dim)
 
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
-        self.register_buffer("position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)))
+        self.register_buffer(
+            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
+        )
 
     def forward(
         self,
@@ -714,9 +715,9 @@ class GroupViTEncoderLayer(nn.Module):
         super().__init__()
         self.embed_dim = config.hidden_size
         self.self_attn = GroupViTAttention(config)
-        self.layer_norm1 = nn.LayerNorm(self.embed_dim)
+        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
         self.mlp = GroupViTMLP(config)
-        self.layer_norm2 = nn.LayerNorm(self.embed_dim)
+        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
 
     def forward(
         self,
@@ -768,7 +769,6 @@ class GroupViTPreTrainedModel(PreTrainedModel):
     config_class = GroupViTConfig
     base_model_prefix = "groupvit"
     supports_gradient_checkpointing = True
-    _keys_to_ignore_on_load_missing = [r"position_ids"]
 
     def _init_weights(self, module):
         """Initialize the weights"""
@@ -857,7 +857,7 @@ GROUPVIT_VISION_INPUTS_DOCSTRING = r"""
     Args:
         pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
             Pixel values. Padding will be ignored by default should you provide it. Pixel values can be obtained using
-            [`CLIPFeatureExtractor`]. See [`CLIPFeatureExtractor.__call__`] for details.
+            [`AutoImageProcessor`]. See [`CLIPImageProcessor.__call__`] for details.
         output_attentions (`bool`, *optional*):
             Whether or not to return the attentions tensors of all attention layers. See `attentions` under returned
             tensors for more detail.
@@ -891,8 +891,8 @@ GROUPVIT_INPUTS_DOCSTRING = r"""
 
             [What are position IDs?](../glossary#position-ids)
         pixel_values (`torch.FloatTensor` of shape `(batch_size, num_channels, height, width)`):
-            Pixel values. Pixel values can be obtained using [`CLIPFeatureExtractor`]. See
-            [`CLIPFeatureExtractor.__call__`] for details.
+            Pixel values. Pixel values can be obtained using [`AutoImageProcessor`]. See
+            [`CLIPImageProcessor.__call__`] for details.
         return_loss (`bool`, *optional*):
             Whether or not to return the contrastive loss.
         output_attentions (`bool`, *optional*):
@@ -931,7 +931,6 @@ class GroupViTVisionEncoder(nn.Module):
         output_attentions: Optional[bool] = None,
         return_dict: Optional[bool] = None,
     ) -> Union[tuple, BaseModelOutput]:
-
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -1068,6 +1067,24 @@ class GroupViTTextEncoder(nn.Module):
         )
 
 
+# Copied from transformers.models.bart.modeling_bart._make_causal_mask
+def _make_causal_mask(
+    input_ids_shape: torch.Size, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0
+):
+    """
+    Make causal mask used for bi-directional self-attention.
+    """
+    bsz, tgt_len = input_ids_shape
+    mask = torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device)
+    mask_cond = torch.arange(mask.size(-1), device=device)
+    mask.masked_fill_(mask_cond < (mask_cond + 1).view(mask.size(-1), 1), 0)
+    mask = mask.to(dtype)
+
+    if past_key_values_length > 0:
+        mask = torch.cat([torch.zeros(tgt_len, past_key_values_length, dtype=dtype, device=device), mask], dim=-1)
+    return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+
+
 # Copied from transformers.models.clip.modeling_clip.CLIPTextTransformer with CLIPText->GroupViTText, CLIPEncoder->GroupViTTextEncoder, CLIP_TEXT->GROUPVIT_TEXT
 class GroupViTTextTransformer(nn.Module):
     def __init__(self, config: GroupViTTextConfig):
@@ -1076,7 +1093,10 @@ class GroupViTTextTransformer(nn.Module):
         embed_dim = config.hidden_size
         self.embeddings = GroupViTTextEmbeddings(config)
         self.encoder = GroupViTTextEncoder(config)
-        self.final_layer_norm = nn.LayerNorm(embed_dim)
+        self.final_layer_norm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
+
+        # For `pooled_output` computation
+        self.eos_token_id = config.eos_token_id
 
     @add_start_docstrings_to_model_forward(GROUPVIT_TEXT_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=BaseModelOutputWithPooling, config_class=GroupViTTextConfig)
@@ -1100,19 +1120,16 @@ class GroupViTTextTransformer(nn.Module):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if input_ids is None:
-            raise ValueError("You have to specify either input_ids")
+            raise ValueError("You have to specify input_ids")
 
         input_shape = input_ids.size()
         input_ids = input_ids.view(-1, input_shape[-1])
 
         hidden_states = self.embeddings(input_ids=input_ids, position_ids=position_ids)
 
-        bsz, seq_len = input_shape
         # CLIP's text model uses causal mask, prepare it here.
         # https://github.com/openai/CLIP/blob/cfcffb90e69f37bf2ff1e988237a0fbe41f33c04/clip/model.py#L324
-        causal_attention_mask = self._build_causal_attention_mask(bsz, seq_len, hidden_states.dtype).to(
-            hidden_states.device
-        )
+        causal_attention_mask = _make_causal_mask(input_shape, hidden_states.dtype, device=hidden_states.device)
         # expand attention_mask
         if attention_mask is not None:
             # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
@@ -1130,12 +1147,26 @@ class GroupViTTextTransformer(nn.Module):
         last_hidden_state = encoder_outputs[0]
         last_hidden_state = self.final_layer_norm(last_hidden_state)
 
-        # text_embeds.shape = [batch_size, sequence_length, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
-        # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
-        pooled_output = last_hidden_state[
-            torch.arange(last_hidden_state.shape[0]), input_ids.to(torch.int).argmax(dim=-1)
-        ]
+        if self.eos_token_id == 2:
+            # The `eos_token_id` was incorrect before PR #24773: Let's keep what have been done here.
+            # A CLIP model with such `eos_token_id` in the config can't work correctly with extra new tokens added
+            # ------------------------------------------------------------
+            # text_embeds.shape = [batch_size, sequence_length, transformer.width]
+            # take features from the eot embedding (eot_token is the highest number in each sequence)
+            # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
+            pooled_output = last_hidden_state[
+                torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
+                input_ids.to(dtype=torch.int, device=last_hidden_state.device).argmax(dim=-1),
+            ]
+        else:
+            # The config gets updated `eos_token_id` from PR #24773 (so the use of exta new tokens is possible)
+            pooled_output = last_hidden_state[
+                torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
+                # We need to get the first position of `eos_token_id` value (`pad_token_ids` might equal to `eos_token_id`)
+                (input_ids.to(dtype=torch.int, device=last_hidden_state.device) == self.eos_token_id)
+                .int()
+                .argmax(dim=-1),
+            ]
 
         if not return_dict:
             return (last_hidden_state, pooled_output) + encoder_outputs[1:]
@@ -1146,15 +1177,6 @@ class GroupViTTextTransformer(nn.Module):
             hidden_states=encoder_outputs.hidden_states,
             attentions=encoder_outputs.attentions,
         )
-
-    def _build_causal_attention_mask(self, bsz, seq_len, dtype):
-        # lazily create causal attention mask, with full attention between the vision tokens
-        # pytorch uses additive attention mask; fill with -inf
-        mask = torch.empty(bsz, seq_len, seq_len, dtype=dtype)
-        mask.fill_(torch.tensor(torch.finfo(dtype).min))
-        mask.triu_(1)  # zero out the lower diagonal
-        mask = mask.unsqueeze(1)  # expand mask
-        return mask
 
 
 class GroupViTTextModel(GroupViTPreTrainedModel):
@@ -1218,7 +1240,7 @@ class GroupViTVisionTransformer(nn.Module):
 
         self.embeddings = GroupViTVisionEmbeddings(config)
         self.encoder = GroupViTVisionEncoder(config)
-        self.layernorm = nn.LayerNorm(embed_dim)
+        self.layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
     @add_start_docstrings_to_model_forward(GROUPVIT_VISION_INPUTS_DOCSTRING)
     @replace_return_docstrings(output_type=BaseModelOutputWithPooling, config_class=GroupViTVisionConfig)
@@ -1362,7 +1384,7 @@ class GroupViTModel(GroupViTPreTrainedModel):
             nn.ReLU(inplace=True),
             nn.Linear(self.projection_intermediate_dim, self.projection_dim, bias=True),
         )
-        self.logit_scale = nn.Parameter(torch.ones([]) * self.config.logit_scale_init_value)
+        self.logit_scale = nn.Parameter(torch.tensor(self.config.logit_scale_init_value))
 
         # Initialize weights and apply final processing
         self.post_init()

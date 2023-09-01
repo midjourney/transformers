@@ -32,6 +32,7 @@ from ...test_modeling_common import (
     ids_tensor,
     random_attention_mask,
 )
+from ...test_pipeline_mixin import PipelineTesterMixin
 
 
 if is_torch_available():
@@ -66,7 +67,7 @@ class UniSpeechSatModelTester:
         conv_bias=False,
         num_conv_pos_embeddings=16,
         num_conv_pos_embedding_groups=2,
-        num_hidden_layers=4,
+        num_hidden_layers=2,
         num_attention_heads=2,
         hidden_dropout_prob=0.1,  # this is most likely not correctly set yet
         intermediate_size=20,
@@ -341,7 +342,7 @@ class UniSpeechSatModelTester:
 
 
 @require_torch
-class UniSpeechSatModelTest(ModelTesterMixin, unittest.TestCase):
+class UniSpeechSatModelTest(ModelTesterMixin, PipelineTesterMixin, unittest.TestCase):
     all_model_classes = (
         (
             UniSpeechSatForCTC,
@@ -353,6 +354,15 @@ class UniSpeechSatModelTest(ModelTesterMixin, unittest.TestCase):
         )
         if is_torch_available()
         else ()
+    )
+    pipeline_model_mapping = (
+        {
+            "audio-classification": UniSpeechSatForSequenceClassification,
+            "automatic-speech-recognition": UniSpeechSatForCTC,
+            "feature-extraction": UniSpeechSatModel,
+        }
+        if is_torch_available()
+        else {}
     )
     test_pruning = False
     test_headmasking = False
@@ -474,7 +484,7 @@ class UniSpeechSatModelTest(ModelTesterMixin, unittest.TestCase):
                     "objective.weight",
                 ]
                 if param.requires_grad:
-                    if any([x in name for x in uniform_init_parms]):
+                    if any(x in name for x in uniform_init_parms):
                         self.assertTrue(
                             -1.0 <= ((param.data.mean() * 1e9).round() / 1e9).item() <= 1.0,
                             msg=f"Parameter {name} of model {model_class} seems not properly initialized",
@@ -685,7 +695,7 @@ class UniSpeechSatRobustModelTest(ModelTesterMixin, unittest.TestCase):
                     "objective.weight",
                 ]
                 if param.requires_grad:
-                    if any([x in name for x in uniform_init_parms]):
+                    if any(x in name for x in uniform_init_parms):
                         self.assertTrue(
                             -1.0 <= ((param.data.mean() * 1e9).round() / 1e9).item() <= 1.0,
                             msg=f"Parameter {name} of model {model_class} seems not properly initialized",

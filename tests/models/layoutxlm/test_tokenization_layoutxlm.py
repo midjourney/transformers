@@ -32,7 +32,6 @@ from transformers.testing_utils import (
     get_tests_dir,
     is_pt_tf_cross_test,
     require_pandas,
-    require_scatter,
     require_sentencepiece,
     require_tokenizers,
     require_torch,
@@ -145,6 +144,19 @@ class LayoutXLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         self.assertEqual(encoding_tokenizer_slow_1, encoding_tokenizer_slow_2)
         self.assertEqual(encoding_tokenizer_slow_1, encoding_tokenizer_slow_3)
 
+    def test_split_special_tokens(self):
+        tokenizer = self.tokenizer_class.from_pretrained("microsoft/layoutxlm-base")
+        _, _, boxes = self.get_question_words_and_boxes()
+        special_token = "[SPECIAL_TOKEN]"
+        tokenizer.add_special_tokens({"additional_special_tokens": [special_token]})
+        encoded_special_token = tokenizer.tokenize(special_token, boxes=boxes, add_special_tokens=False)
+        self.assertEqual(len(encoded_special_token), 1)
+
+        encoded_split_special_token = tokenizer.tokenize(
+            special_token, add_special_tokens=False, split_special_tokens=True, boxes=boxes
+        )
+        self.assertTrue(len(encoded_split_special_token) > 1)
+
     @slow
     def test_sequence_builders(self):
         tokenizer = self.tokenizer_class.from_pretrained("microsoft/layoutxlm-base")
@@ -195,7 +207,6 @@ class LayoutXLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         tokenizers: List[LayoutXLMTokenizer] = self.get_tokenizers(do_lower_case=False)
         for tokenizer in tokenizers:
             with self.subTest(f"{tokenizer.__class__.__name__}"):
-
                 special_token = "[SPECIAL_TOKEN]"
                 special_token_box = [1000, 1000, 1000, 1000]
 
@@ -426,7 +437,6 @@ class LayoutXLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         tokenizers = self.get_tokenizers(do_lower_case=False)
         for tokenizer in tokenizers:
             with self.subTest(f"{tokenizer.__class__.__name__}"):
-
                 # test 1: single sequence
                 words, boxes = self.get_words_and_boxes()
 
@@ -1099,7 +1109,6 @@ class LayoutXLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         tokenizers = self.get_tokenizers()
         for tokenizer in tokenizers:
             with self.subTest(f"{tokenizer.__class__.__name__}"):
-
                 # test 1: single sequence
                 words, boxes = self.get_words_and_boxes()
 
@@ -1176,7 +1185,6 @@ class LayoutXLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
 
     @require_torch
     @slow
-    @require_scatter
     def test_torch_encode_plus_sent_to_model(self):
         import torch
 
@@ -1187,7 +1195,6 @@ class LayoutXLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
         tokenizers = self.get_tokenizers(do_lower_case=False)
         for tokenizer in tokenizers:
             with self.subTest(f"{tokenizer.__class__.__name__}"):
-
                 if tokenizer.__class__ not in MODEL_TOKENIZER_MAPPING:
                     return
 
@@ -1450,7 +1457,6 @@ class LayoutXLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
     def test_special_tokens_initialization(self):
         for tokenizer, pretrained_name, kwargs in self.tokenizers_list:
             with self.subTest(f"{tokenizer.__class__.__name__} ({pretrained_name})"):
-
                 added_tokens = [AddedToken("<special>", lstrip=True)]
 
                 tokenizer_r = self.rust_tokenizer_class.from_pretrained(
@@ -1686,7 +1692,6 @@ class LayoutXLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
             tokenizer = self.rust_tokenizer_class.from_pretrained(pretrained_name, **kwargs)
 
             with self.subTest(f"{tokenizer.__class__.__name__} ({pretrained_name}, {tokenizer.__class__.__name__})"):
-
                 if is_torch_available():
                     returned_tensor = "pt"
                 elif is_tf_available():
@@ -1855,7 +1860,6 @@ class LayoutXLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
 
     @slow
     def test_layoutxlm_integration_test(self):
-
         tokenizer_p = LayoutXLMTokenizer.from_pretrained("microsoft/layoutxlm-base")
         tokenizer_r = LayoutXLMTokenizerFast.from_pretrained("microsoft/layoutxlm-base")
 
@@ -1945,4 +1949,12 @@ class LayoutXLMTokenizationTest(TokenizerTesterMixin, unittest.TestCase):
 
     @unittest.skip("Doesn't support another framework than PyTorch")
     def test_np_encode_plus_sent_to_model(self):
+        pass
+
+    @unittest.skip("Doesn't use SentencePiece")
+    def test_sentencepiece_tokenize_and_convert_tokens_to_string(self):
+        pass
+
+    @unittest.skip("Doesn't use SentencePiece")
+    def test_sentencepiece_tokenize_and_decode(self):
         pass
